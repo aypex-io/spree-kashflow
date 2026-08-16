@@ -1,0 +1,12 @@
+en:
+  spree:
+    admin:
+      integrations:
+        kashflow:
+          brand_name: "KashFlow"
+          username: "API username"
+          password: "API password"
+          sales_nominal_code: "Sales nominal code"
+          shipping_nominal_code: "Shipping nominal code"
+          bank_account_id: "Bank account"
+          payment_method_id: "Payment method"
