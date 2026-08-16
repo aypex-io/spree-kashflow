@@ -15,6 +15,86 @@ RSpec.describe Spree::Kashflow::Client do
     end
   end
 
+  describe "#currencies" do
+    it "returns each currency as a hash with coerced types" do
+      stub_kashflow_call(
+        '<GetCurrenciesResponse xmlns="KashFlowAPI"><GetCurrenciesResult>' \
+        "<Currencies><CurrencyId>1</CurrencyId><CurrencyCode>GBP</CurrencyCode>" \
+        "<ExchangeRate>1</ExchangeRate><isDefault>1</isDefault></Currencies>" \
+        "<Currencies><CurrencyId>2</CurrencyId><CurrencyCode>USD</CurrencyCode>" \
+        "<ExchangeRate>1.3</ExchangeRate><isDefault>0</isDefault></Currencies>" \
+        "</GetCurrenciesResult></GetCurrenciesResponse>"
+      )
+
+      expect(client.currencies).to eq(
+        [{code: "GBP", id: 1}, {code: "USD", id: 2}]
+      )
+    end
+
+    it "returns an empty array when KashFlow has no currencies" do
+      stub_kashflow_call('<GetCurrenciesResponse xmlns="KashFlowAPI"><GetCurrenciesResult /></GetCurrenciesResponse>')
+
+      expect(client.currencies).to eq([])
+    end
+  end
+
+  describe "#nominal_codes" do
+    it "returns each nominal code as a hash with coerced types" do
+      stub_kashflow_call(
+        '<GetNominalCodesResponse xmlns="KashFlowAPI"><GetNominalCodesResult>' \
+        "<NominalCode><id>10</id><Code>4000</Code><Name>Sales</Name>" \
+        "<debit>0</debit><credit>0</credit><balance>0</balance></NominalCode>" \
+        "<NominalCode><id>11</id><Code>5000</Code><Name>Purchases</Name>" \
+        "<debit>0</debit><credit>0</credit><balance>0</balance></NominalCode>" \
+        "</GetNominalCodesResult></GetNominalCodesResponse>"
+      )
+
+      expect(client.nominal_codes).to eq(
+        [{id: 10, name: "Sales"}, {id: 11, name: "Purchases"}]
+      )
+    end
+
+    it "returns an empty array when KashFlow has no nominal codes" do
+      stub_kashflow_call('<GetNominalCodesResponse xmlns="KashFlowAPI"><GetNominalCodesResult /></GetNominalCodesResponse>')
+
+      expect(client.nominal_codes).to eq([])
+    end
+  end
+
+  describe "#bank_accounts" do
+    it "returns each bank account as a hash with coerced types" do
+      stub_kashflow_call(
+        '<GetBankAccountsResponse xmlns="KashFlowAPI"><GetBankAccountsResult>' \
+        "<BankAccount><AccountID>1</AccountID><AccountName>Current</AccountName>" \
+        "<AccountCode>1200</AccountCode></BankAccount>" \
+        "<BankAccount><AccountID>2</AccountID><AccountName>Savings</AccountName>" \
+        "<AccountCode>1210</AccountCode></BankAccount>" \
+        "</GetBankAccountsResult></GetBankAccountsResponse>"
+      )
+
+      expect(client.bank_accounts).to eq(
+        [{id: 1, name: "Current"}, {id: 2, name: "Savings"}]
+      )
+    end
+
+    it "returns a one-element array when KashFlow has a single bank account" do
+      stub_kashflow_call(
+        '<GetBankAccountsResponse xmlns="KashFlowAPI"><GetBankAccountsResult>' \
+        "<BankAccount><AccountID>1</AccountID><AccountName>Current</AccountName>" \
+        "<AccountCode>1200</AccountCode></BankAccount>" \
+        "</GetBankAccountsResult></GetBankAccountsResponse>"
+      )
+
+      expect(client.bank_accounts).to eq([{id: 1, name: "Current"}])
+    end
+
+    it "returns an empty array when KashFlow has no bank accounts" do
+      stub_kashflow_call('<GetBankAccountsResponse xmlns="KashFlowAPI"><GetBankAccountsResult /></GetBankAccountsResponse>')
+
+      expect(client.bank_accounts).to eq([])
+    end
+  end
+
   describe "#create_invoice" do
     it "returns the invoice number KashFlow assigned" do
       stub_kashflow_call(
