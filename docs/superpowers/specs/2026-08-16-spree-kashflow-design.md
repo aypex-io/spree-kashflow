@@ -42,6 +42,19 @@ Out of scope:
 - Spree **>= 5.6.0**, Ruby **>= 3.3**.
 - Follow `spree-shipstation`: `Spree::Integration` subclass, admin form partial,
   registration via `config/initializers/spree.rb`.
+- Scaffold with **`rails plugin new`**, not `bundle gem` and not by hand: this is
+  an engine (it ships `app/`), and the `develop-ruby-gem` skill reserves
+  `bundle gem` for plain and Railtie gems. Conform the generated skeleton to the
+  Spree extension conventions afterwards rather than hand-building it.
+- **Runtime dependencies in the gemspec, development dependencies in the
+  Gemfile** (`spree-fixed_amt_discount` put `spree_dev_tools` in the gemspec;
+  that is the wrong side of the line).
+- `# frozen_string_literal: true` on every Ruby file, without exception.
+- **YARD on every public class and public method**, verified with
+  `yard stats --list-undoc`.
+- TDD per the shared contract: first red must be an **assertion** failure, not a
+  `NameError` — add the empty class or method, then show the assertion failing,
+  then implement.
 - **No migrations and no install generator.** Sync state lives in metafields.
 - Exactly **one** decorator in the whole gem (`Spree::Refund`), and it may only
   enqueue a job.
@@ -113,12 +126,27 @@ degrades checkout.
 class Kashflow < Spree::Integration
   preference :username, :string
   preference :password, :password
+  preference :sales_nominal_code, :integer     # InvoiceLine#ChargeType for product lines
+  preference :shipping_nominal_code, :integer  # InvoiceLine#ChargeType for the shipping line
+  preference :bank_account_id, :integer        # Payment#PayAccount
+  preference :payment_method_id, :integer      # Payment#PayMethod
 end
 ```
 
-Both required. `integration_group` is `"Accounting"`; `icon_path` points at a
-bundled logo; `can_connect?` makes one cheap authenticated call so an admin
-learns credentials are wrong when saving, not at the first order.
+The four numeric preferences are **accounting configuration, not implementation
+detail** — they decide which ledger accounts the money lands in, and a wrong
+value posts real revenue to the wrong nominal code. They were not in the first
+draft of this spec; the WSDL revealed that `InvoiceLine#ChargeType` and
+`Payment#PayAccount` / `#PayMethod` are required identifiers with no sensible
+default.
+
+`GetNominalCodes` and `GetBankAccounts` both exist on the API, so the admin form
+populates these as **dropdowns fetched from the connected account** rather than
+free-text integers. Free text here would be an invitation to mis-post.
+
+`integration_group` is `"Accounting"`; `icon_path` points at a bundled logo;
+`can_connect?` makes one cheap authenticated call so an admin learns credentials
+are wrong when saving, not at the first order.
 
 Credentials are per-store — `Spree::Integration` belongs_to store, which matters
 for TKF's multi-market setup.
@@ -305,13 +333,62 @@ publishing. Runtime dependencies `spree >= 5.6.0`, `spree_extension`, `savon`.
 First release **0.1.0**. Gem name availability on RubyGems confirmed 2026-08-16
 (`spree-kashflow` and `spree_kashflow` both unclaimed).
 
+## WSDL findings (read 2026-08-16 from the live WSDL, 166 operations)
+
+The field names below are taken from the WSDL itself, not from documentation or
+the 2018 gem. They supersede any guess elsewhere in this document.
+
+**Operations used**
+
+| Purpose | Operation | Signature |
+|---|---|---|
+| Create customer | `InsertCustomer` | `(UserName, Password, custr: Customer)` |
+| Create invoice | `InsertInvoice_TypeDefined` | `(UserName, Password, Inv_TD: Invoice_TypeDefined)` |
+| Record payment | `InsertInvoicePayment` | `(UserName, Password, InvoicePayment: Payment)` |
+| Enabled currencies | `GetCurrencies` | `(UserName, Password)` |
+| Nominal codes | `GetNominalCodes` | `(UserName, Password)` |
+| Bank accounts | `GetBankAccounts` | `(UserName, Password)` |
+
+Prefer `InsertInvoice_TypeDefined` over `InsertInvoice`: the latter carries
+`Lines` as `ArrayOfAnyType`, the former takes a properly typed structure.
+
+**`Invoice` fields that matter:** `InvoiceNumber:int`, `InvoiceDate:dateTime`,
+`DueDate:dateTime`, `CustomerID:int`, `CustomerReference:string`,
+`CurrencyCode:string`, `ExchangeRate:decimal`, `Lines`, `NetAmount:decimal`,
+`VATAmount:decimal`, `AmountPaid:decimal`.
+
+**`InvoiceLine` fields:** `Quantity:decimal`, `Description:string`,
+`Rate:decimal`, `ChargeType:int`, `VatRate:decimal`, `VatAmount:decimal`,
+`ProductID:int`, `Sort:int`, `ValuesInCurrency:integer`.
+
+Note `Rate` and `Quantity` are both `decimal` with no scale fixed in the schema,
+which *softens* but does not remove the unit-rate rounding concern above — the
+service may still round server-side, so the correctness guard stays.
+
+**`Payment` fields:** `PayInvoice:int` (the invoice number), `PayDate:dateTime`,
+`PayAmount:decimal`, `PayMethod:int`, `PayAccount:int`, `PayNote:string`.
+
+**`Customer`** has 78 fields; the ones used are `Code`, `Name`, `Email`,
+`Address1`–`Address4`, `Postcode`, `CountryCode`, `VATNumber`, `CurrencyID`,
+`ContactFirstName`, `ContactLastName`. It also carries `EC:int` and
+`OutsideEC:int` VAT-treatment flags, which are relevant to TKF's US/UK/EU markets
+and should be set from the customer's country rather than left default.
+
+**Credit notes.** There is **no** `InsertCreditNote` operation. KashFlow models a
+credit note as an invoice with negative values; `applyCreditNoteToInvoice` exists
+to link one to the invoice it credits. So `CreditNotePayload` builds a negative
+invoice through the same `InsertInvoice_TypeDefined` path and then calls
+`applyCreditNoteToInvoice` against the original invoice number stored in the
+order's `kashflow.invoice_number` metafield.
+
 ## Open questions for implementation
 
 1. Whether `set_metafield` requires a pre-existing `MetafieldDefinition`.
-2. The exact SOAP field names for currency on `InsertInvoice`, and how credit
-   notes are represented (a negative invoice versus a distinct entity) — to be
-   read from the WSDL rather than guessed.
-3. Whether KashFlow enforces API rate limits worth backing off from.
+2. Whether KashFlow enforces API rate limits worth backing off from.
+3. What `ValuesInCurrency` on `InvoiceLine` controls — whether line values are
+   expressed in the invoice currency or the account's base currency. This must be
+   settled before multi-currency invoices are posted, since getting it wrong
+   mis-states every non-GBP invoice.
 
 ## Risks
 
