@@ -18,6 +18,11 @@ module Spree
       # @return [String] the ISO 3166-1 alpha-2 code KashFlow treats as the United Kingdom
       UNITED_KINGDOM_CODE = "GB"
 
+      # @return [String] the order metadata key a host application must write for
+      #   `VATNumber` to be included in the payload. Spree has no dedicated VAT number
+      #   column, so this gem reads it out of `order.metadata` under this key.
+      VAT_NUMBER_METADATA_KEY = "vat_number"
+
       ##
       # @param order [Spree::Order] a completed order with a billing address
       #
@@ -32,12 +37,12 @@ module Spree
       def to_h
         payload = {
           "Code" => order.email,
-          "Name" => bill_address.full_name,
+          "Name" => customer_name,
           "Email" => order.email,
           "Address1" => bill_address.address1,
           "Address2" => bill_address.address2,
           "Address3" => bill_address.city,
-          "Address4" => bill_address.company,
+          "Address4" => bill_address.state_name_text,
           "Postcode" => bill_address.zipcode,
           "CountryCode" => billing_country_code,
           "ContactFirstName" => bill_address.firstname,
@@ -62,6 +67,18 @@ module Spree
       end
 
       ##
+      # KashFlow separates the customer (an organisation, for business buyers) from the
+      # contact person on the order. The billing company stands in for the former when
+      # present; an individual buyer's name is used otherwise.
+      #
+      # @return [String] the billing company name, or the billing full name when there
+      #   is no company
+      #
+      def customer_name
+        bill_address.company.presence || bill_address.full_name
+      end
+
+      ##
       # @return [String, nil] the billing address's ISO 3166-1 alpha-2 country code
       #
       def billing_country_code
@@ -80,7 +97,7 @@ module Spree
       #   Spree has no dedicated column for it
       #
       def vat_number
-        order.metadata&.dig("vat_number")
+        order.metadata&.dig(VAT_NUMBER_METADATA_KEY)
       end
 
       ##

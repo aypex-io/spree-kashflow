@@ -17,6 +17,7 @@ RSpec.describe Spree::Kashflow::CustomerPayload do
       address1: "12 Mercer Street",
       address2: "Floor 3",
       city: "London",
+      state_name: "Greater London",
       zipcode: "WC2H 9QJ",
       country: billing_country
     )
@@ -31,7 +32,7 @@ RSpec.describe Spree::Kashflow::CustomerPayload do
         "Address1" => "12 Mercer Street",
         "Address2" => "Floor 3",
         "Address3" => "London",
-        "Address4" => "Analytical Engines Ltd",
+        "Address4" => "Greater London",
         "Postcode" => "WC2H 9QJ",
         "CountryCode" => "GB"
       )
@@ -47,6 +48,37 @@ RSpec.describe Spree::Kashflow::CustomerPayload do
 
     it "splits the billing name into ContactFirstName and ContactLastName" do
       expect(payload.to_h).to include("ContactFirstName" => "Ada", "ContactLastName" => "Lovelace")
+    end
+
+    context "when the billing address has a company" do
+      it "uses the company as the Name field" do
+        expect(payload.to_h["Name"]).to eq("Analytical Engines Ltd")
+      end
+
+      it "still carries the person on ContactFirstName/ContactLastName" do
+        expect(payload.to_h).to include("ContactFirstName" => "Ada", "ContactLastName" => "Lovelace")
+      end
+    end
+
+    context "when the billing address has no company" do
+      let(:bill_address) do
+        build_stubbed(
+          :address,
+          firstname: "Ada",
+          lastname: "Lovelace",
+          company: nil,
+          address1: "12 Mercer Street",
+          address2: "Floor 3",
+          city: "London",
+          state_name: "Greater London",
+          zipcode: "WC2H 9QJ",
+          country: billing_country
+        )
+      end
+
+      it "falls back to the billing full name as the Name field" do
+        expect(payload.to_h["Name"]).to eq("Ada Lovelace")
+      end
     end
 
     context "when the billing country matches the store's own country" do
