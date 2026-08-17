@@ -28,7 +28,7 @@ module Spree
     class CreditNotePayload
       # @return [String] the order metafield key this gem reads the original
       #   KashFlow invoice number from
-      INVOICE_NUMBER_METAFIELD_KEY = "kashflow.invoice_number"
+      INVOICE_NUMBER_METAFIELD_KEY = Spree::Kashflow::Metafields::ORDER_INVOICE_NUMBER
 
       ##
       # @param refund [Spree::Refund] the refund to post as a KashFlow credit note
