@@ -65,6 +65,26 @@ RSpec.describe Spree::Kashflow::CreditNotePayload do
       it "carries the original invoice number as CustomerReference" do
         expect(payload.to_h["CustomerReference"]).to eq("INV-00042")
       end
+
+      it "sets NetAmount to the negation of the invoice's NetAmount" do
+        invoice = Spree::Kashflow::InvoicePayload.new(order, integration: integration).to_h
+        expect(payload.to_h["NetAmount"]).to eq(-invoice["NetAmount"])
+      end
+
+      it "sets VATAmount to the negation of the invoice's VATAmount" do
+        invoice = Spree::Kashflow::InvoicePayload.new(order, integration: integration).to_h
+        expect(payload.to_h["VATAmount"]).to eq(-invoice["VATAmount"])
+      end
+
+      it "agrees NetAmount with the sum of Rate * Quantity across lines" do
+        result = payload.to_h
+        expect(result["NetAmount"]).to eq(result["Lines"].sum { |l| l["Rate"] * l["Quantity"] })
+      end
+
+      it "agrees VATAmount with the sum of VatAmount across lines" do
+        result = payload.to_h
+        expect(result["VATAmount"]).to eq(result["Lines"].sum { |l| l["VatAmount"] })
+      end
     end
 
     context "with a partial refund" do
@@ -94,6 +114,36 @@ RSpec.describe Spree::Kashflow::CreditNotePayload do
 
       it "carries the original invoice number as CustomerReference" do
         expect(payload.to_h["CustomerReference"]).to eq("INV-00042")
+      end
+
+      # NetAmount = refund.amount / (1 + blended_rate), where blended_rate =
+      # order.included_tax_total / (order.total - order.included_tax_total).
+      # With refund.amount = 24.00, this mirrors the arithmetic already proven
+      # for the line's Rate above; the envelope must carry the same value with
+      # the same sign so a ledger consumer never sees a line/total mismatch.
+      it "sets NetAmount to the same negative net portion as the line's Rate" do
+        blended_rate = order.included_tax_total / (order.total - order.included_tax_total)
+        expected_net = (refund.amount / (1 + blended_rate)).round(2)
+        expect(payload.to_h["NetAmount"]).to eq(-expected_net)
+      end
+
+      # VATAmount = refund.amount - NetAmount's magnitude, negated to match the
+      # line's VatAmount.
+      it "sets VATAmount to the negative VAT portion of the refund" do
+        blended_rate = order.included_tax_total / (order.total - order.included_tax_total)
+        expected_net = (refund.amount / (1 + blended_rate)).round(2)
+        expected_vat = refund.amount - expected_net
+        expect(payload.to_h["VATAmount"]).to eq(-expected_vat)
+      end
+
+      it "agrees NetAmount with the sum of Rate * Quantity across lines" do
+        result = payload.to_h
+        expect(result["NetAmount"]).to eq(result["Lines"].sum { |l| l["Rate"] * l["Quantity"] })
+      end
+
+      it "agrees VATAmount with the sum of VatAmount across lines" do
+        result = payload.to_h
+        expect(result["VATAmount"]).to eq(result["Lines"].sum { |l| l["VatAmount"] })
       end
     end
   end
