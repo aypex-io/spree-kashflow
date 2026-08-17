@@ -77,6 +77,24 @@ been posted to a real account and read back. Verifying an invoice, a payment and
 a credit note end-to-end against a live (or sandbox) KashFlow account is a
 release gate, not an optional extra.
 
+Check these, in this order:
+
+1. **The `"OK"` status token — check this first.** `Client::SUCCESS_STATUS` is
+   `"OK"`. The WSDL declares `Status` as a bare `s:string` with no
+   `<s:enumeration>` and no documentation naming the success value, so `"OK"` is
+   KashFlow's documented *convention*, not something the schema pins down. If the
+   real token differs, **every successful post raises `ApiError`** — the
+   comparison inverts completely. Because `ApiError` is now discarded rather than
+   retried, that failure mode is quiet: no duplicate invoices, but every single
+   order fails with a `kashflow.sync_error` and nothing reaches KashFlow. Post one
+   invoice and read the raw `Status` back before anything else.
+2. **An invoice** — that the lines, VAT and totals render as expected, and that
+   `Sort` orders them the way you want.
+3. **A payment** — that `InsertInvoicePayment` returns a non-zero payment id and
+   the invoice shows as paid.
+4. **A credit note** — that `applyCreditNoteToInvoice` returns `true` and the
+   credit note appears linked to the original invoice, not floating on its own.
+
 ### Wiring the customer's VAT number
 
 Spree has no dedicated column for a customer's VAT number, and this gem does not
@@ -101,10 +119,46 @@ A sync is triggered by:
   an admin issuing an ad-hoc refund directly against a payment, which Spree
   doesn't route through a reimbursement event.
 
-Syncs are **idempotent**: `SyncOrderJob` no-ops once the order carries a
-`kashflow.invoice_number` metafield, and `SyncRefundJob` no-ops once the refund
-carries a `kashflow.credit_note_number` metafield. The same order or refund
-firing more than one trigger — or a job retrying — never double-books.
+### Resume semantics
+
+Each job is a small **resumable state machine**, not an all-or-nothing unit. Both
+make two KashFlow calls that must be tracked separately, and each call is
+followed *immediately* by the metafield that records it:
+
+| Job | Step 1 | Marker | Step 2 | Marker |
+|---|---|---|---|---|
+| `SyncOrderJob` | post the invoice | `kashflow.invoice_number` | record the payment | `kashflow.payment_recorded_at` |
+| `SyncRefundJob` | post the credit note | `kashflow.credit_note_number` | link it to the invoice | `kashflow.credit_note_linked_at` |
+
+Each step is guarded on its **own** marker. A rerun skips whatever has already
+succeeded and resumes at the first unfinished step, so the same order or refund
+firing more than one trigger — or a job retrying — never double-books, and never
+strands a half-finished sync either.
+
+The ordering is the point. **Creating a ledger document must be at-most-once;
+applying a payment or a link is naturally re-attemptable.** So the invoice number
+is written the instant `InsertInvoice_TypeDefined` returns, before the payment is
+even attempted. A duplicate invoice overstates revenue and VAT, is structurally
+valid so nothing in KashFlow flags it, and remains a permanent artefact even
+after being credit-noted. A permanently-unpaid invoice recognises revenue
+correctly, surfaces in aged debtors at month-end, and is a one-click fix. If
+exactly one of those has to be possible, it is the second.
+
+A whole-job guard would undo this, which is why there isn't one: keyed on the
+invoice number, it would see the key the failed run just wrote, no-op, and strand
+the unpaid invoice for good.
+
+One accepted consequence: an order can carry **both** an invoice number and a
+`kashflow.sync_error`. That combination is accurate rather than contradictory —
+the invoice genuinely exists in KashFlow, and only the payment failed. It also
+keeps `SyncRefundJob`'s precondition guard (which refuses to credit-note an order
+with no invoice number) working for such an order.
+
+A business rejection from KashFlow (`Spree::Kashflow::ApiError`) is **discarded,
+not retried**. A nominal code that doesn't exist or a `PayAccount` that isn't a
+bank account does not become valid on the 25th attempt, and the
+`kashflow.sync_error` metafield is already the operator-visible record. Only
+transport failures are retried.
 
 A sync **never blocks checkout**. Both jobs run asynchronously via Active Job,
 after the order has already completed or the refund has already been created.

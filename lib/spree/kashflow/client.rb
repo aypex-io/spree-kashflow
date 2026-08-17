@@ -117,25 +117,41 @@ module Spree
       ##
       # Records a payment against an invoice in KashFlow.
       #
+      # The WSDL declares `InsertInvoicePaymentResult` as an `s:int` — the id of
+      # the payment KashFlow created. A `0` is therefore a rejection reported
+      # without a `Status`, and returning `true` regardless would leave the
+      # invoice permanently unpaid while the caller recorded a successful sync.
+      #
       # @param payload [Hash] a KashFlow `Payment` structure
       # @return [TrueClass] true when the payment was recorded
-      # @raise [Spree::Kashflow::Error] when the request fails
+      # @raise [Spree::Kashflow::ApiError] when the request fails, or when
+      #   KashFlow returns no payment id
       #
       def record_invoice_payment(payload)
-        call(:insert_invoice_payment, {"InvoicePayment" => payload})
+        response = call(:insert_invoice_payment, {"InvoicePayment" => payload})
+        result = response.dig("InsertInvoicePaymentResponse", "InsertInvoicePaymentResult")
+        assert_identifier!(result, "payment id")
         true
       end
 
       ##
       # Applies a credit note to an invoice in KashFlow.
       #
+      # The WSDL declares `applyCreditNoteToInvoiceResult` as an `s:boolean`.
+      # A `false` is a refusal to link, and swallowing it produces exactly the
+      # orphan credit note {SyncRefundJob}'s precondition guard exists to
+      # prevent — a credit note sitting in KashFlow attached to nothing.
+      #
       # @param credit_note_number [Integer] the KashFlow credit note id
       # @param invoice_number [Integer] the KashFlow invoice id
       # @return [TrueClass] true when the credit note was applied
-      # @raise [Spree::Kashflow::Error] when the request fails
+      # @raise [Spree::Kashflow::ApiError] when the request fails, or when
+      #   KashFlow refuses to link the credit note
       #
       def apply_credit_note(credit_note_number:, invoice_number:)
-        call(:apply_credit_note_to_invoice, {"InvoiceID" => invoice_number, "CreditNoteID" => credit_note_number})
+        response = call(:apply_credit_note_to_invoice, {"InvoiceID" => invoice_number, "CreditNoteID" => credit_note_number})
+        result = response.dig("applyCreditNoteToInvoiceResponse", "applyCreditNoteToInvoiceResult")
+        assert_accepted!(result, "did not apply credit note #{credit_note_number} to invoice #{invoice_number}")
         true
       end
 
@@ -236,6 +252,23 @@ module Spree
         return identifier unless result.nil? || identifier.zero?
 
         raise ApiError, "KashFlow returned no #{label} (result: #{result.inspect})"
+      end
+
+      ##
+      # The counterpart of {#assert_identifier!} for the operations the WSDL types
+      # as `s:boolean` rather than `s:int`. Savon hands the element back as the
+      # string `"true"` / `"false"`, so only an explicit `"true"` is acceptance;
+      # `false`, `nil` and an absent element are all rejections.
+      #
+      # @param result [Object, nil] the raw result element
+      # @param message [String] what KashFlow refused, for the error message
+      # @return [void]
+      # @raise [Spree::Kashflow::ApiError] when the result is not true
+      #
+      def assert_accepted!(result, message)
+        return if result.to_s.strip.casecmp("true").zero?
+
+        raise ApiError, "KashFlow #{message} (result: #{result.inspect})"
       end
 
       ##

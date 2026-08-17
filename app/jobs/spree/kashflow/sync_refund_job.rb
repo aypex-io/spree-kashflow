@@ -6,13 +6,20 @@ module Spree
     # Posts a refund to KashFlow as a credit note, linked to the original invoice
     # via `applyCreditNoteToInvoice`.
     #
-    # Idempotent by design, the same way as {SyncOrderJob}: a second run for the
-    # same refund is a no-op once the refund carries a
-    # {Metafields::REFUND_CREDIT_NOTE_NUMBER} metafield.
+    # A resumable state machine, the same way as {SyncOrderJob}: posting the
+    # credit note and linking it to the original invoice are two separate calls,
+    # each with its own marker written the instant it succeeds
+    # ({Metafields::REFUND_CREDIT_NOTE_NUMBER} and
+    # {Metafields::REFUND_CREDIT_NOTE_LINKED_AT}), and each guarded independently
+    # in {#sync}. A rerun resumes at the first unfinished step.
     #
     class SyncRefundJob < Spree::BaseJob
       # See {SyncOrderJob}: bad credentials will never succeed on retry.
       discard_on Spree::Kashflow::AuthenticationError
+
+      # See {SyncOrderJob}: a business rejection does not become acceptance on the
+      # 25th attempt, and {Metafields::ORDER_SYNC_ERROR} already records it.
+      discard_on Spree::Kashflow::ApiError
 
       # See {SyncOrderJob}: KashFlow being briefly unreachable is retry-safe.
       retry_on Spree::Kashflow::TransportError, wait: :polynomially_longer, attempts: 5
@@ -31,7 +38,7 @@ module Spree
         integration = Spree::Integrations::Kashflow.active.find_by(store: order.store)
         return if integration.nil?
 
-        return if refund.has_metafield?(Metafields::REFUND_CREDIT_NOTE_NUMBER)
+        return if credit_note_posted?(refund) && credit_note_linked?(refund)
 
         sync(refund, order, integration)
       rescue Spree::Kashflow::Error => e
@@ -64,16 +71,53 @@ module Spree
         client = integration.client
         customer_id = client.upsert_customer(CustomerPayload.new(order).to_h)
 
-        credit_note_number = client.create_invoice(credit_note_envelope(refund, order, integration, customer_id))
+        # Written the instant `create_invoice` returns, before the link call is
+        # attempted. A credit note is a ledger document: creating it must be
+        # at-most-once, because a duplicate permanently overstates the credit and
+        # nothing in KashFlow flags it. Linking one that already exists is a
+        # separate, re-attemptable step. Writing this marker last — so that a
+        # failed link left the refund "unposted" — is precisely what made a retry
+        # post a *second* credit note, manufacturing the orphan the guard above
+        # exists to prevent rather than avoiding it.
+        unless credit_note_posted?(refund)
+          posted_number = client.create_invoice(credit_note_envelope(refund, order, integration, customer_id))
+          Metafields.write(refund, Metafields::REFUND_CREDIT_NOTE_NUMBER, posted_number)
+        end
+
+        # Guarded separately, and by its own marker rather than by the credit note
+        # number: re-applying a link is unverified against a live account, so it
+        # is never attempted twice.
+        return if credit_note_linked?(refund)
 
         invoice_number = order.get_metafield(CreditNotePayload::INVOICE_NUMBER_METAFIELD_KEY).value.to_i
-        client.apply_credit_note(credit_note_number: credit_note_number, invoice_number: invoice_number)
+        client.apply_credit_note(credit_note_number: credit_note_number(refund), invoice_number: invoice_number)
+        Metafields.write(refund, Metafields::REFUND_CREDIT_NOTE_LINKED_AT, Time.current)
+      end
 
-        # Written last, after `apply_credit_note` has succeeded. Written before
-        # it, a failing link call would leave behind exactly the unlinked credit
-        # note the guard above exists to prevent — and the idempotency check
-        # would then no-op every retry.
-        Metafields.write(refund, Metafields::REFUND_CREDIT_NOTE_NUMBER, credit_note_number)
+      ##
+      # @param refund [Spree::Refund]
+      # @return [TrueClass, FalseClass] whether the credit note has already been
+      #   posted to KashFlow for this refund
+      #
+      def credit_note_posted?(refund)
+        refund.has_metafield?(Metafields::REFUND_CREDIT_NOTE_NUMBER)
+      end
+
+      ##
+      # @param refund [Spree::Refund]
+      # @return [TrueClass, FalseClass] whether the credit note has already been
+      #   linked to the original invoice
+      #
+      def credit_note_linked?(refund)
+        refund.has_metafield?(Metafields::REFUND_CREDIT_NOTE_LINKED_AT)
+      end
+
+      ##
+      # @param refund [Spree::Refund]
+      # @return [Integer, nil] the KashFlow credit note number recorded on the refund
+      #
+      def credit_note_number(refund)
+        refund.get_metafield(Metafields::REFUND_CREDIT_NOTE_NUMBER)&.value&.to_i
       end
 
       ##

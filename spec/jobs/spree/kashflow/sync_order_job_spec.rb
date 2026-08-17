@@ -144,26 +144,61 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
         expect(client).to have_received(:record_invoice_payment)
       end
 
-      # The idempotency key is written LAST for exactly this reason. Written
-      # before `record_invoice_payment`, a rejected payment (a wrong PayAccount
-      # is the obvious case) would make the retry no-op on idempotency and the
-      # invoice would stay unpaid in KashFlow forever.
+      it "records the payment step separately from the invoice number" do
+        described_class.perform_now(order.id)
+
+        expect(order.reload.has_metafield?(Spree::Kashflow::Metafields::ORDER_PAYMENT_RECORDED_AT)).to be(true)
+      end
+
+      # Creating an invoice must be at-most-once: a duplicate overstates revenue
+      # and VAT, no KashFlow report flags it, and it survives being credit-noted.
+      # So the invoice number is written the instant `create_invoice` returns,
+      # and each step is guarded on its own marker so the retry resumes at the
+      # payment rather than re-posting the invoice or no-opping entirely.
       context "and recording the payment fails" do
         before do
           allow(client).to receive(:record_invoice_payment)
             .and_raise(Spree::Kashflow::ApiError, "PayAccount 99 does not exist")
         end
 
-        it "leaves the order retryable rather than marking it synced" do
-          suppress(Spree::Kashflow::ApiError) { described_class.perform_now(order.id) }
+        it "still records the invoice number KashFlow assigned" do
+          described_class.perform_now(order.id)
 
-          expect(order.reload.has_metafield?(Spree::Kashflow::Metafields::ORDER_INVOICE_NUMBER)).to be(false)
+          expect(order.reload.get_metafield(Spree::Kashflow::Metafields::ORDER_INVOICE_NUMBER).value).to eq("98765")
         end
 
-        it "posts the invoice again on the retry" do
-          2.times { suppress(Spree::Kashflow::ApiError) { described_class.perform_now(order.id) } }
+        it "does not mark the payment as recorded" do
+          described_class.perform_now(order.id)
 
-          expect(client).to have_received(:create_invoice).twice
+          expect(order.reload.has_metafield?(Spree::Kashflow::Metafields::ORDER_PAYMENT_RECORDED_AT)).to be(false)
+        end
+
+        it "does not mark the order synced" do
+          described_class.perform_now(order.id)
+
+          expect(order.reload.has_metafield?(Spree::Kashflow::Metafields::ORDER_SYNCED_AT)).to be(false)
+        end
+
+        it "posts the invoice exactly once across a retry" do
+          2.times { described_class.perform_now(order.id) }
+
+          expect(client).to have_received(:create_invoice).once
+        end
+
+        it "retries only the failed payment step" do
+          2.times { described_class.perform_now(order.id) }
+
+          expect(client).to have_received(:record_invoice_payment).twice
+        end
+
+        it "resumes at the payment step and completes when KashFlow accepts it" do
+          described_class.perform_now(order.id)
+          allow(client).to receive(:record_invoice_payment).and_return(true)
+
+          described_class.perform_now(order.id)
+
+          expect(client).to have_received(:create_invoice).once
+          expect(order.reload.has_metafield?(Spree::Kashflow::Metafields::ORDER_SYNCED_AT)).to be(true)
         end
       end
     end
@@ -177,13 +212,31 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
     end
 
     context "when the order's currency is not enabled in KashFlow" do
-      let(:client) { instance_double(Spree::Kashflow::Client, currencies: [{code: "GBP", id: 1}]) }
+      let(:client) do
+        instance_double(Spree::Kashflow::Client, currencies: [{code: "GBP", id: 1}], upsert_customer: 555)
+      end
 
-      it "raises an ApiError naming the currency" do
-        expect { described_class.perform_now(order.id) }.to raise_error(Spree::Kashflow::ApiError, /USD/)
+      it "refuses to post the invoice" do
+        described_class.perform_now(order.id)
+
+        expect(client).not_to have_received(:upsert_customer)
+      end
+
+      it "records a sync error naming the currency" do
+        described_class.perform_now(order.id)
+
+        expect(order.reload.get_metafield(Spree::Kashflow::Metafields::ORDER_SYNC_ERROR).value).to match(/USD/)
       end
     end
 
+    # An ApiError is a business rejection — a nominal code that doesn't exist, a
+    # PayAccount that isn't a bank account. It has no policy of its own before
+    # this, so it inherited the backend default: up to 25 attempts. The
+    # kashflow.sync_error metafield is already the operator-visible record, so
+    # the job now discards instead. These two examples therefore assert a
+    # discard where they previously asserted a re-raise; the raise-and-record
+    # behaviour inside #perform is unchanged and still covered by the sync_error
+    # assertion.
     context "when KashFlow refuses the request" do
       let(:client) { instance_double(Spree::Kashflow::Client, currencies: [{code: "USD", id: 1}]) }
 
@@ -191,12 +244,12 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
         allow(client).to receive(:upsert_customer).and_raise(Spree::Kashflow::ApiError, "nominal code invalid")
       end
 
-      it "re-raises the ApiError" do
-        expect { described_class.perform_now(order.id) }.to raise_error(Spree::Kashflow::ApiError)
+      it "discards the job rather than retrying a rejection" do
+        expect { described_class.perform_now(order.id) }.not_to raise_error
       end
 
-      it "writes the failure message to kashflow.sync_error" do
-        suppress(Spree::Kashflow::ApiError) { described_class.perform_now(order.id) }
+      it "writes the failure message to kashflow.sync_error before discarding" do
+        described_class.perform_now(order.id)
 
         expect(order.reload.get_metafield(Spree::Kashflow::Metafields::ORDER_SYNC_ERROR).value).to eq("nominal code invalid")
       end

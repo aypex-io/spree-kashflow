@@ -5,11 +5,16 @@ module Spree
     ##
     # Posts a completed order to KashFlow as an invoice.
     #
-    # Idempotent by design: a second run for the same order is a no-op once the
-    # order carries a {Metafields::ORDER_INVOICE_NUMBER} metafield, which is what
-    # makes it safe to retry and to enqueue this job from more than one trigger
-    # (a subscriber and a decorator both firing for the same event, for instance)
-    # without double-booking. Takes an id, never an {Spree::Order}, so ActiveJob's
+    # A resumable state machine, not an all-or-nothing job. Posting the invoice
+    # and recording its payment are two separate KashFlow calls, each with its own
+    # metafield marker written the instant it succeeds
+    # ({Metafields::ORDER_INVOICE_NUMBER} and
+    # {Metafields::ORDER_PAYMENT_RECORDED_AT}), and each guarded independently in
+    # {#sync}. A rerun therefore resumes at the first unfinished step rather than
+    # replaying the whole job or skipping it wholesale — which is what makes it
+    # safe both to retry and to enqueue from more than one trigger (a subscriber
+    # and a decorator both firing for the same event, for instance) without
+    # double-booking. Takes an id, never an {Spree::Order}, so ActiveJob's
     # argument serialisation never has to round-trip a whole AR object.
     #
     class SyncOrderJob < Spree::BaseJob
@@ -18,6 +23,15 @@ module Spree
       # job discards (see the `rescue` in {#perform}, which runs before ActiveJob's
       # `discard_on` handler).
       discard_on Spree::Kashflow::AuthenticationError
+
+      # An {Spree::Kashflow::ApiError} is a business rejection — a nominal code
+      # that doesn't exist, a disabled currency, a `PayAccount` that isn't a real
+      # bank account. None of those change by being asked again, and without a
+      # policy here the error would inherit the backend default (25 attempts on
+      # Sidekiq). The {Metafields::ORDER_SYNC_ERROR} metafield written by
+      # {#perform}'s `rescue` — which runs before this handler — is already the
+      # operator-visible record, so the job discards rather than churning.
+      discard_on Spree::Kashflow::ApiError
 
       # KashFlow being briefly unreachable is exactly the case retrying recovers
       # from automatically.
@@ -36,7 +50,7 @@ module Spree
         integration = Spree::Integrations::Kashflow.active.find_by(store: order.store)
         return if integration.nil?
 
-        return if order.has_metafield?(Metafields::ORDER_INVOICE_NUMBER)
+        return if invoice_posted?(order) && payment_settled?(order)
 
         sync(order, integration)
       rescue Spree::Kashflow::Error => e
@@ -47,13 +61,27 @@ module Spree
       private
 
       ##
-      # Every KashFlow call this job makes happens before any metafield is
-      # written, and {Metafields::ORDER_INVOICE_NUMBER} — the idempotency key —
-      # is written last of all. Writing it earlier makes a failure in a
-      # follow-on call (a wrong `PayAccount` rejecting the payment, say)
-      # unrecoverable: the retry sees the key, no-ops, and the invoice stays
-      # unpaid in KashFlow forever. Written last, a failed follow-on leaves the
-      # order retryable.
+      # Each KashFlow call is followed immediately by the metafield that records
+      # it, and each is skipped independently when its metafield is already
+      # present.
+      #
+      # Creating an invoice must be at-most-once; recording a payment against an
+      # invoice that already exists is naturally re-attemptable. So
+      # {Metafields::ORDER_INVOICE_NUMBER} is written the instant
+      # `create_invoice` returns, before `record_payment` is even attempted. A
+      # duplicate invoice overstates revenue and VAT, is structurally valid so no
+      # KashFlow report flags it, and remains a permanent artefact even after
+      # being credit-noted. A permanently-unpaid invoice recognises revenue
+      # correctly, surfaces in aged debtors at month-end, and is a one-click fix.
+      #
+      # Guarding per step rather than at the top of {#perform} is the other half
+      # of that: a whole-job guard keyed on the invoice number would see the key a
+      # retry just wrote and no-op, stranding the unpaid invoice for good.
+      #
+      # A consequence, accepted deliberately: an order can carry both an invoice
+      # number and a {Metafields::ORDER_SYNC_ERROR}. That is accurate — the
+      # invoice genuinely exists in KashFlow — and it keeps {SyncRefundJob}'s
+      # precondition guard working for an order whose payment never posted.
       #
       # @param order [Spree::Order]
       # @param integration [Spree::Integrations::Kashflow]
@@ -64,13 +92,48 @@ module Spree
         assert_currency_enabled!(order, client)
 
         customer_id = client.upsert_customer(CustomerPayload.new(order).to_h)
-        invoice_number = client.create_invoice(invoice_envelope(order, integration, customer_id))
-        record_payment(order, integration, client, invoice_number) if order.paid?
-
         Metafields.write(order, Metafields::ORDER_CUSTOMER_CODE, customer_id)
+
+        unless invoice_posted?(order)
+          invoice_number = client.create_invoice(invoice_envelope(order, integration, customer_id))
+          Metafields.write(order, Metafields::ORDER_INVOICE_NUMBER, invoice_number)
+        end
+
+        unless payment_settled?(order)
+          record_payment(order, integration, client, invoice_number(order))
+          Metafields.write(order, Metafields::ORDER_PAYMENT_RECORDED_AT, Time.current)
+        end
+
         Metafields.write(order, Metafields::ORDER_SYNCED_AT, Time.current)
         Metafields.write(order, Metafields::ORDER_SYNC_ERROR, nil)
-        Metafields.write(order, Metafields::ORDER_INVOICE_NUMBER, invoice_number)
+      end
+
+      ##
+      # @param order [Spree::Order]
+      # @return [TrueClass, FalseClass] whether the invoice has already been
+      #   posted to KashFlow for this order
+      #
+      def invoice_posted?(order)
+        order.has_metafield?(Metafields::ORDER_INVOICE_NUMBER)
+      end
+
+      ##
+      # An unpaid order has no payment step to complete, so it counts as settled.
+      #
+      # @param order [Spree::Order]
+      # @return [TrueClass, FalseClass] whether the payment step is done or
+      #   inapplicable
+      #
+      def payment_settled?(order)
+        !order.paid? || order.has_metafield?(Metafields::ORDER_PAYMENT_RECORDED_AT)
+      end
+
+      ##
+      # @param order [Spree::Order]
+      # @return [Integer, nil] the KashFlow invoice number recorded on the order
+      #
+      def invoice_number(order)
+        order.get_metafield(Metafields::ORDER_INVOICE_NUMBER)&.value&.to_i
       end
 
       ##

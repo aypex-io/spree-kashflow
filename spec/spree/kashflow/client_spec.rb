@@ -176,6 +176,68 @@ RSpec.describe Spree::Kashflow::Client do
     end
   end
 
+  # The WSDL declares InsertInvoicePaymentResult as s:int and
+  # applyCreditNoteToInvoiceResult as s:boolean. Both were discarded, so a
+  # rejection delivered as 0/false with no Status read as success — for the
+  # credit note that produced exactly the orphan SyncRefundJob guards against.
+  describe "#record_invoice_payment" do
+    it "returns true when KashFlow returns a payment id" do
+      stub_kashflow_call(
+        '<InsertInvoicePaymentResponse xmlns="KashFlowAPI">' \
+        "<InsertInvoicePaymentResult>9012</InsertInvoicePaymentResult>" \
+        "</InsertInvoicePaymentResponse>"
+      )
+
+      expect(client.record_invoice_payment({"PayInvoice" => 4471})).to be(true)
+    end
+
+    it "raises ApiError when KashFlow returns a payment id of 0" do
+      stub_kashflow_call(
+        '<InsertInvoicePaymentResponse xmlns="KashFlowAPI">' \
+        "<InsertInvoicePaymentResult>0</InsertInvoicePaymentResult>" \
+        "</InsertInvoicePaymentResponse>"
+      )
+
+      expect { client.record_invoice_payment({}) }.to raise_error(Spree::Kashflow::ApiError, /payment id/)
+    end
+
+    it "raises ApiError when the result element is absent altogether" do
+      stub_kashflow_call('<InsertInvoicePaymentResponse xmlns="KashFlowAPI" />')
+
+      expect { client.record_invoice_payment({}) }.to raise_error(Spree::Kashflow::ApiError, /payment id/)
+    end
+  end
+
+  describe "#apply_credit_note" do
+    it "returns true when KashFlow applies the credit note" do
+      stub_kashflow_call(
+        '<applyCreditNoteToInvoiceResponse xmlns="KashFlowAPI">' \
+        "<applyCreditNoteToInvoiceResult>true</applyCreditNoteToInvoiceResult>" \
+        "</applyCreditNoteToInvoiceResponse>"
+      )
+
+      expect(client.apply_credit_note(credit_note_number: 4321, invoice_number: 98765)).to be(true)
+    end
+
+    it "raises ApiError naming both documents when KashFlow refuses to link them" do
+      stub_kashflow_call(
+        '<applyCreditNoteToInvoiceResponse xmlns="KashFlowAPI">' \
+        "<applyCreditNoteToInvoiceResult>false</applyCreditNoteToInvoiceResult>" \
+        "</applyCreditNoteToInvoiceResponse>"
+      )
+
+      expect { client.apply_credit_note(credit_note_number: 4321, invoice_number: 98765) }
+        .to raise_error(Spree::Kashflow::ApiError, /4321.*98765/)
+    end
+
+    it "raises ApiError when the result element is absent altogether" do
+      stub_kashflow_call('<applyCreditNoteToInvoiceResponse xmlns="KashFlowAPI" />')
+
+      expect { client.apply_credit_note(credit_note_number: 4321, invoice_number: 98765) }
+        .to raise_error(Spree::Kashflow::ApiError)
+    end
+  end
+
   # The defect these cover: KashFlow reports business-level rejections at HTTP
   # 200 with an empty result element and a Status/StatusDetail pair beside it.
   # Uninspected, `nil.to_i` made that a KashFlow identifier of 0 that the job

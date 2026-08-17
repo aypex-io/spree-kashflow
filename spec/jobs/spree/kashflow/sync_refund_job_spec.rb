@@ -70,19 +70,54 @@ RSpec.describe Spree::Kashflow::SyncRefundJob do
         expect(client).to have_received(:apply_credit_note).with(credit_note_number: 4321, invoice_number: 98765)
       end
 
-      # The idempotency key is written after `apply_credit_note` succeeds.
-      # Written before it, a failing link call would leave behind exactly the
-      # unlinked credit note the job's own up-front guard exists to prevent.
+      it "records the link step separately from the credit note number" do
+        described_class.perform_now(refund.id)
+
+        expect(refund.reload.has_metafield?(Spree::Kashflow::Metafields::REFUND_CREDIT_NOTE_LINKED_AT)).to be(true)
+      end
+
+      # Creating a credit note must be at-most-once, exactly as for an invoice.
+      # Writing the number only after `apply_credit_note` succeeded meant a
+      # failed link guaranteed the retry posted a *second* credit note —
+      # manufacturing the orphan the job's up-front guard exists to prevent.
       context "and linking the credit note fails" do
         before do
           allow(client).to receive(:apply_credit_note)
             .and_raise(Spree::Kashflow::ApiError, "invoice 98765 is already fully credited")
         end
 
-        it "leaves the refund retryable rather than marking it synced" do
-          suppress(Spree::Kashflow::ApiError) { described_class.perform_now(refund.id) }
+        it "still records the credit note number KashFlow assigned" do
+          described_class.perform_now(refund.id)
 
-          expect(refund.reload.has_metafield?(Spree::Kashflow::Metafields::REFUND_CREDIT_NOTE_NUMBER)).to be(false)
+          expect(refund.reload.get_metafield(Spree::Kashflow::Metafields::REFUND_CREDIT_NOTE_NUMBER).value).to eq("4321")
+        end
+
+        it "does not mark the credit note as linked" do
+          described_class.perform_now(refund.id)
+
+          expect(refund.reload.has_metafield?(Spree::Kashflow::Metafields::REFUND_CREDIT_NOTE_LINKED_AT)).to be(false)
+        end
+
+        it "posts the credit note exactly once across a retry" do
+          2.times { described_class.perform_now(refund.id) }
+
+          expect(client).to have_received(:create_invoice).once
+        end
+
+        it "retries only the failed link step" do
+          2.times { described_class.perform_now(refund.id) }
+
+          expect(client).to have_received(:apply_credit_note).twice
+        end
+
+        it "resumes at the link step and completes when KashFlow accepts it" do
+          described_class.perform_now(refund.id)
+          allow(client).to receive(:apply_credit_note).and_return(true)
+
+          described_class.perform_now(refund.id)
+
+          expect(client).to have_received(:create_invoice).once
+          expect(refund.reload.has_metafield?(Spree::Kashflow::Metafields::REFUND_CREDIT_NOTE_LINKED_AT)).to be(true)
         end
       end
 
@@ -138,9 +173,22 @@ RSpec.describe Spree::Kashflow::SyncRefundJob do
       end
     end
 
+    # As in SyncOrderJob, an ApiError is now discarded rather than re-raised —
+    # a rejection does not become acceptance on the 25th attempt, and
+    # kashflow.sync_error is the operator-visible record. The refusal itself is
+    # unchanged and still asserted, via that metafield.
     context "when the order has no KashFlow invoice number" do
-      it "raises an ApiError instead of posting an orphan credit note" do
-        expect { described_class.perform_now(refund.id) }.to raise_error(Spree::Kashflow::ApiError, /invoice number/)
+      it "does not post an orphan credit note" do
+        described_class.perform_now(refund.id)
+
+        expect(client).not_to have_received(:create_invoice)
+      end
+
+      it "records the refusal on the order rather than retrying it" do
+        expect { described_class.perform_now(refund.id) }.not_to raise_error
+
+        expect(order.reload.get_metafield(Spree::Kashflow::Metafields::ORDER_SYNC_ERROR).value)
+          .to match(/invoice number/)
       end
     end
   end

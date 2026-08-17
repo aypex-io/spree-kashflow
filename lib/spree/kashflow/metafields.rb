@@ -21,11 +21,21 @@ module Spree
     # ever meant for a customer.
     #
     module Metafields
-      # @return [String] order metafield; the KashFlow invoice number. Set once the
-      #   order is posted; its presence is the idempotency check {SyncOrderJob} uses
-      #   to refuse re-posting, and the identifier {CreditNotePayload} carries as
-      #   `CustomerReference` when a refund is posted as a credit note.
+      # @return [String] order metafield; the KashFlow invoice number. Written
+      #   immediately after `InsertInvoice_TypeDefined` returns, before any
+      #   follow-on call, so a later failure can never cause the invoice to be
+      #   posted twice. Its presence is the per-step guard {SyncOrderJob} uses to
+      #   skip re-posting the invoice, and it is the identifier
+      #   {CreditNotePayload} carries as `CustomerReference` when a refund is
+      #   posted as a credit note.
       ORDER_INVOICE_NUMBER = "kashflow.invoice_number"
+
+      # @return [String] order metafield; the timestamp at which the order's
+      #   payment was recorded against the KashFlow invoice. Written immediately
+      #   after `InsertInvoicePayment` succeeds, and checked separately from
+      #   {ORDER_INVOICE_NUMBER} so a retry resumes at the payment step instead of
+      #   re-posting the invoice or skipping the job wholesale.
+      ORDER_PAYMENT_RECORDED_AT = "kashflow.payment_recorded_at"
 
       # @return [String] order metafield; the KashFlow customer id returned by
       #   `Client#upsert_customer`.
@@ -39,9 +49,17 @@ module Spree
       ORDER_SYNC_ERROR = "kashflow.sync_error"
 
       # @return [String] refund metafield; the KashFlow credit note (invoice) number.
-      #   Set once the refund is posted; its presence is the idempotency check
-      #   {SyncRefundJob} uses to refuse re-posting.
+      #   Written immediately after the credit note is posted, before the link
+      #   call, so a failing link can never cause a second credit note. Its
+      #   presence is the per-step guard {SyncRefundJob} uses to skip re-posting.
       REFUND_CREDIT_NOTE_NUMBER = "kashflow.credit_note_number"
+
+      # @return [String] refund metafield; the timestamp at which the credit note
+      #   was linked to the original invoice via `applyCreditNoteToInvoice`.
+      #   Checked separately from {REFUND_CREDIT_NOTE_NUMBER} so a retry re-runs
+      #   only the link step. Re-applying a link is unverified against a live
+      #   account, so this marker exists to avoid attempting it twice.
+      REFUND_CREDIT_NOTE_LINKED_AT = "kashflow.credit_note_linked_at"
 
       # @return [String] the `display_on` value every definition this gem owns
       #   is seeded with: admin-only, never rendered on the storefront.
