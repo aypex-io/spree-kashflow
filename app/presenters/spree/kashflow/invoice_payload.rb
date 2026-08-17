@@ -30,6 +30,10 @@ module Spree
       ##
       # @return [Array<Hash{String => Object}>] the KashFlow `InvoiceLine` structures:
       #   one per Spree line item, plus one for shipping
+      # @note Unreconciled. Only {#to_h} runs the correctness guard; a caller that
+      #   needs the guarantee that these lines actually add up to the order's total
+      #   (Task 6's credit notes, for instance) must go through {#to_h}, not call
+      #   this directly.
       #
       def lines
         line_entries.map { |entry| entry[:line] }
@@ -65,13 +69,23 @@ module Spree
       attr_reader :integration
 
       ##
+      # Assigns each entry's `Sort` as a 1-based line index (line items first, then
+      # shipping). 1-based, not 0-based: `Sort` is an ordering column and 0 is also
+      # the natural "unset" sentinel in the same .NET model, so a first line of 0
+      # would be ambiguous between "first" and "not sorted". Of every field this
+      # class fills with a placeholder, `Sort` is the one with observable
+      # behaviour — it controls line ordering on the rendered KashFlow invoice —
+      # and should be confirmed against a real sandbox call before relying on it.
+      #
       # @return [Array<Hash{Symbol => Object}>] one entry per line item and one for
       #   shipping, each carrying both the public `:line` hash and the unrounded
       #   `:net_total` the guard reconciles it against
       #
       def line_entries
-        order.line_items.map { |line_item| line_item_entry(line_item) } +
+        entries = order.line_items.map { |line_item| line_item_entry(line_item) } +
           order.shipments.map { |shipment| shipment_entry(shipment) }
+        entries.each_with_index { |entry, index| entry[:line]["Sort"] = index + 1 }
+        entries
       end
 
       ##
@@ -80,7 +94,7 @@ module Spree
       #
       def line_item_entry(line_item)
         build_entry(
-          gross: line_item.amount + line_item.promo_total,
+          gross: line_item.taxable_basis,
           included_tax_total: line_item.included_tax_total,
           quantity: BigDecimal(line_item.quantity),
           description: line_item_description(line_item),
@@ -94,7 +108,7 @@ module Spree
       #
       def shipment_entry(shipment)
         build_entry(
-          gross: shipment.cost + shipment.promo_total,
+          gross: shipment.taxable_basis,
           included_tax_total: shipment.included_tax_total,
           quantity: BigDecimal(1),
           description: SHIPPING_DESCRIPTION,
@@ -103,7 +117,9 @@ module Spree
       end
 
       ##
-      # @param gross [BigDecimal] the discounted, VAT-inclusive amount
+      # @param gross [BigDecimal] the taxable basis: the discounted, VAT-inclusive
+      #   amount Spree itself taxes (`taxable_basis`), which already accounts for
+      #   both line-level and whole-order promotion allocations
       # @param included_tax_total [BigDecimal] the VAT baked into `gross`
       # @param quantity [BigDecimal]
       # @param description [String]
@@ -122,7 +138,16 @@ module Spree
             "Rate" => rate,
             "ChargeType" => charge_type,
             "VatRate" => vat_rate(included_tax_total, net_total),
-            "VatAmount" => included_tax_total
+            "VatAmount" => included_tax_total,
+            # KashFlow does not sync against the Spree catalogue, so there is no
+            # KashFlow product to reference.
+            "ProductID" => 0,
+            # No KashFlow project is associated with these invoices.
+            "ProjID" => 0,
+            # Assigned by KashFlow on insert; not known until then.
+            "LineID" => 0
+            # "Sort" is filled in by #line_entries once every entry's position is
+            # known.
           }
         }
       end
@@ -163,6 +188,14 @@ module Spree
       # The correctness guard. Raises rather than returns a payload whose figures
       # do not reconcile — a failed sync is a queryable flag, a wrong invoice is a
       # discrepancy someone finds at year end.
+      #
+      # @note Known limitation: this guard only accounts for VAT baked into the
+      #   price (`included_tax_total`) and the whole-order allocation captured by
+      #   `taxable_basis`. An order with exclusive tax (`additional_tax_total`,
+      #   added on top of the price rather than included in it) is not reconciled
+      #   by this arithmetic and will make the guard raise — refused rather than
+      #   mis-booked, which is the safe direction, but exclusive-tax orders are not
+      #   otherwise handled by this mapper.
       #
       # @param entries [Array<Hash{Symbol => Object}>]
       # @return [void]

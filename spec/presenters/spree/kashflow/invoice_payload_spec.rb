@@ -173,8 +173,7 @@ RSpec.describe Spree::Kashflow::InvoicePayload do
         instance_double(
           Spree::LineItem,
           name: "Unreconcilable widget",
-          amount: BigDecimal("1.00"),
-          promo_total: BigDecimal(0),
+          taxable_basis: BigDecimal("1.00"),
           included_tax_total: BigDecimal(0),
           quantity: 1_000_000,
           adjustments: Spree::Adjustment.none
@@ -191,11 +190,45 @@ RSpec.describe Spree::Kashflow::InvoicePayload do
       end
 
       it "raises TotalMismatchError and returns no payload" do
-        expect { payload.to_h }.to raise_error(Spree::Kashflow::TotalMismatchError)
+        expect { payload.to_h }.to raise_error(Spree::Kashflow::TotalMismatchError, /Unreconcilable widget/)
       end
     end
 
+    # This used to be constructed with a real order-level promotion (a whole-order
+    # `CreateAdjustment`), but fix round 1 made the mapper use `taxable_basis`
+    # specifically so whole-order promotions reconcile correctly (see the
+    # "order-level promotion" context below) — so that scenario no longer
+    # diverges, and can no longer exercise this branch. Guard 2 is now exercised
+    # with an engineered double instead: a line item that reconciles perfectly on
+    # its own (proving guard 1 passes), paired with an order whose `total` is
+    # simply wrong for what the lines add up to.
     context "when the assembled total diverges from order.total" do
+      let(:reconciling_line_item) do
+        instance_double(
+          Spree::LineItem,
+          name: "Reconciling widget",
+          taxable_basis: BigDecimal("10.00"),
+          included_tax_total: BigDecimal(0),
+          quantity: 1,
+          adjustments: Spree::Adjustment.none
+        )
+      end
+      let(:order) do
+        instance_double(
+          Spree::Order,
+          line_items: [reconciling_line_item],
+          shipments: [],
+          currency: "USD",
+          total: BigDecimal("999.00")
+        )
+      end
+
+      it "raises TotalMismatchError" do
+        expect { payload.to_h }.to raise_error(Spree::Kashflow::TotalMismatchError, /order\.total/)
+      end
+    end
+
+    context "when an order-level promotion applies" do
       let(:order) do
         order = create(:order_with_line_items, store: store, currency: "USD", line_items_count: 0, ship_address: create(:address))
         create(:line_item, order: order, variant: standard_product.master, price: 60, quantity: 1, currency: "USD")
@@ -216,8 +249,14 @@ RSpec.describe Spree::Kashflow::InvoicePayload do
         order.reload
       end
 
-      it "raises TotalMismatchError" do
-        expect { payload.to_h }.to raise_error(Spree::Kashflow::TotalMismatchError)
+      it "syncs successfully instead of raising" do
+        expect { payload.to_h }.not_to raise_error
+      end
+
+      it "produces a payload whose assembled total reconciles with order.total" do
+        result = payload.to_h
+        assembled = result["NetAmount"] + result["VATAmount"]
+        expect(assembled).to eq(order.total)
       end
     end
   end
