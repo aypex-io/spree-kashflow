@@ -21,5 +21,12 @@ module Spree
     # Raised when the KashFlow service could not be reached. Retryable.
     #
     class TransportError < Error; end
+
+    ##
+    # Raised by {Spree::Kashflow::InvoicePayload#to_h} when the assembled invoice
+    # lines fail to reconcile against either the line's own net total or the
+    # order's total. Nothing is posted to KashFlow when this is raised.
+    #
+    class TotalMismatchError < Error; end
   end
 end
