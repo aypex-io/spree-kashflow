@@ -47,6 +47,10 @@ module Spree
       # @raise [Spree::Kashflow::TotalMismatchError] when a line's `Rate * Quantity`
       #   fails to reconcile against its net total, or the assembled invoice fails
       #   to reconcile against the order's total
+      # @note Known limitation: orders with exclusive tax (`additional_tax_total`,
+      #   added on top of the price rather than included in it) are not reconciled
+      #   by this arithmetic and will always raise here — refused rather than
+      #   mis-booked, but not otherwise handled by this mapper.
       #
       def to_h
         entries = line_entries
@@ -142,12 +146,16 @@ module Spree
             # KashFlow does not sync against the Spree catalogue, so there is no
             # KashFlow product to reference.
             "ProductID" => 0,
+            # Seeded here (not just appended later) to hold this key's position in
+            # WSDL sequence order — Savon serialises a Hash body in insertion
+            # order, and a .NET ASMX endpoint enforcing <s:sequence> will drop or
+            # mis-bind an out-of-order element rather than raise. #line_entries
+            # overwrites this in place once every entry's position is known.
+            "Sort" => nil,
             # No KashFlow project is associated with these invoices.
             "ProjID" => 0,
             # Assigned by KashFlow on insert; not known until then.
             "LineID" => 0
-            # "Sort" is filled in by #line_entries once every entry's position is
-            # known.
           }
         }
       end

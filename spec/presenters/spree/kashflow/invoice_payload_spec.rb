@@ -249,6 +249,10 @@ RSpec.describe Spree::Kashflow::InvoicePayload do
         order.reload
       end
 
+      it "applies the order-level discount (fixture precondition)" do
+        expect(order.adjustment_total).to eq(BigDecimal("-5"))
+      end
+
       it "syncs successfully instead of raising" do
         expect { payload.to_h }.not_to raise_error
       end
