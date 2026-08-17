@@ -13,3 +13,9 @@ RSpec.describe "integration registration" do
     expect(registered.count(Spree::Integrations::Kashflow)).to eq(1)
   end
 end
+
+RSpec.describe "subscriber registration" do
+  it "registers both KashFlow subscribers" do
+    expect(Spree.subscribers).to include(Spree::Kashflow::OrderCompletedSubscriber, Spree::Kashflow::ReimbursementSubscriber)
+  end
+end
