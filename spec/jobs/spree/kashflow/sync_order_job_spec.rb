@@ -67,9 +67,9 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
       described_class.perform_now(order.id)
 
       expect(captured.keys).to eq(%w[
-        InvoiceDBID InvoiceNumber InvoiceDate DueDate CustomerID Paid SuppressTotal
-        ProjectID CurrencyCode ExchangeRate Lines NetAmount VATAmount AmountPaid
-        UseCustomDeliveryAddress CISRCNetAmount CISRCVatAmount IsCISReverseCharge
+        InvoiceDBID InvoiceNumber InvoiceDate DueDate CustomerID Paid CustomerReference
+        SuppressTotal ProjectID CurrencyCode ExchangeRate Lines NetAmount VATAmount
+        AmountPaid CISRCNetAmount CISRCVatAmount IsCISReverseCharge
       ])
     end
 
@@ -82,8 +82,33 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
 
       described_class.perform_now(order.id)
 
-      expect(captured.values_at("UseCustomDeliveryAddress", "CISRCNetAmount", "CISRCVatAmount", "IsCISReverseCharge"))
-        .to eq([false, 0, 0, false])
+      expect(captured.values_at("CISRCNetAmount", "CISRCVatAmount", "IsCISReverseCharge"))
+        .to eq([0, 0, false])
+    end
+
+    it "wraps the invoice lines in the ArrayOfInvoiceLine element the WSDL declares" do
+      captured = nil
+      allow(client).to receive(:create_invoice) { |payload|
+        captured = payload
+        98765
+      }
+
+      described_class.perform_now(order.id)
+
+      expect(captured["Lines"].keys).to eq(["InvoiceLine"])
+      expect(captured["Lines"]["InvoiceLine"]).to all(include("Rate"))
+    end
+
+    it "sets CustomerReference to the Spree order number" do
+      captured = nil
+      allow(client).to receive(:create_invoice) { |payload|
+        captured = payload
+        98765
+      }
+
+      described_class.perform_now(order.id)
+
+      expect(captured["CustomerReference"]).to eq(order.number)
     end
 
     it "does not call the client when no integration exists for the order's store" do
@@ -102,6 +127,14 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
       expect(client).not_to have_received(:upsert_customer)
     end
 
+    it "seeds its metafield definitions as back-end only, never storefront-visible" do
+      described_class.perform_now(order.id)
+
+      definitions = Spree::MetafieldDefinition.where(namespace: "kashflow")
+      expect(definitions.pluck(:key)).to match_array(%w[invoice_number customer_code synced_at sync_error])
+      expect(definitions.pluck(:display_on).uniq).to eq(["back_end"])
+    end
+
     context "when the order is paid" do
       before { create(:payment, order: order, amount: order.total, state: "completed") }
 
@@ -109,6 +142,29 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
         described_class.perform_now(order.id)
 
         expect(client).to have_received(:record_invoice_payment)
+      end
+
+      # The idempotency key is written LAST for exactly this reason. Written
+      # before `record_invoice_payment`, a rejected payment (a wrong PayAccount
+      # is the obvious case) would make the retry no-op on idempotency and the
+      # invoice would stay unpaid in KashFlow forever.
+      context "and recording the payment fails" do
+        before do
+          allow(client).to receive(:record_invoice_payment)
+            .and_raise(Spree::Kashflow::ApiError, "PayAccount 99 does not exist")
+        end
+
+        it "leaves the order retryable rather than marking it synced" do
+          suppress(Spree::Kashflow::ApiError) { described_class.perform_now(order.id) }
+
+          expect(order.reload.has_metafield?(Spree::Kashflow::Metafields::ORDER_INVOICE_NUMBER)).to be(false)
+        end
+
+        it "posts the invoice again on the retry" do
+          2.times { suppress(Spree::Kashflow::ApiError) { described_class.perform_now(order.id) } }
+
+          expect(client).to have_received(:create_invoice).twice
+        end
       end
     end
 

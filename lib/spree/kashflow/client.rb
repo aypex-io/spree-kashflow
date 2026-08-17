@@ -17,6 +17,17 @@ module Spree
       # @return [Regexp] matches SOAP faults caused by bad credentials
       AUTH_FAULT = /invalid.*(username|password)|not authori[sz]ed/i
 
+      # @return [String] the in-band `Status` value KashFlow returns on success.
+      #
+      # The WSDL declares `Status` as a bare `s:string` on every `*Response`
+      # element (`minOccurs="0"`), with no `<s:enumeration>` and no
+      # `<wsdl:documentation>` naming the success value — so this constant is
+      # KashFlow's documented convention (`"OK"`), not something the schema
+      # pins down. Comparison is case-insensitive, and an *absent* `Status`
+      # (legal, since `minOccurs="0"`) is treated as success; only a present
+      # `Status` that is not `"OK"` is a business-level rejection.
+      SUCCESS_STATUS = "OK"
+
       ##
       # @param username [String] the KashFlow API username
       # @param password [String] the KashFlow API password
@@ -80,11 +91,13 @@ module Spree
       #
       # @param payload [Hash] a KashFlow `Customer` structure
       # @return [Integer] the KashFlow customer id
-      # @raise [Spree::Kashflow::Error] when the request fails
+      # @raise [Spree::Kashflow::ApiError] when the request fails, or when
+      #   KashFlow returns no usable customer id
       #
       def upsert_customer(payload)
         response = call(:insert_customer, {"custr" => payload})
-        response.dig("InsertCustomerResponse", "InsertCustomerResult").to_i
+        result = response.dig("InsertCustomerResponse", "InsertCustomerResult")
+        assert_identifier!(result, "customer id")
       end
 
       ##
@@ -92,11 +105,13 @@ module Spree
       #
       # @param payload [Hash] a KashFlow `Invoice_TypeDefined` structure
       # @return [Integer] the invoice number KashFlow assigned
-      # @raise [Spree::Kashflow::Error] when the request fails
+      # @raise [Spree::Kashflow::ApiError] when the request fails, or when
+      #   KashFlow returns no usable invoice number
       #
       def create_invoice(payload)
         response = call(:insert_invoice_type_defined, {"Inv_TD" => payload})
-        response.dig("InsertInvoice_TypeDefinedResponse", "InsertInvoice_TypeDefinedResult").to_i
+        result = response.dig("InsertInvoice_TypeDefinedResponse", "InsertInvoice_TypeDefinedResult")
+        assert_identifier!(result, "invoice number")
       end
 
       ##
@@ -139,7 +154,8 @@ module Spree
 
       ##
       # Invokes a KashFlow SOAP operation, merging credentials into every request, and
-      # maps transport and SOAP-fault errors onto this gem's error hierarchy.
+      # maps transport errors, SOAP faults and in-band `Status` rejections onto this
+      # gem's error hierarchy.
       #
       # @param operation [Symbol] the Savon operation name
       # @param message [Hash] the operation's message body, excluding credentials
@@ -151,16 +167,75 @@ module Spree
       def call(operation, message = {})
         credentials = {"UserName" => @username, "Password" => @password}
         response = savon_client.call(operation, message: credentials.merge(message))
-        response.body
+        body = response.body
+        assert_status!(body)
+        body
       rescue Savon::SOAPFault => e
         fault_message = e.to_hash.dig(:fault, :faultstring) || e.message
-        if fault_message.match?(AUTH_FAULT)
-          raise AuthenticationError, fault_message
-        else
-          raise ApiError, fault_message
-        end
-      rescue Savon::HTTPError, HTTPI::SSLError, Errno::ECONNREFUSED, Net::OpenTimeout, Net::ReadTimeout => e
+        raise_business_error(fault_message)
+      rescue Savon::HTTPError, HTTPI::SSLError, OpenSSL::SSL::SSLError, SocketError,
+        Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::ETIMEDOUT, Errno::EHOSTUNREACH,
+        Net::OpenTimeout, Net::ReadTimeout => e
         raise TransportError, e.message
+      end
+
+      ##
+      # KashFlow reports business-level rejections *in band*: the SOAP call
+      # succeeds at HTTP 200 with an empty result element and a `Status` /
+      # `StatusDetail` pair beside it. Left uninspected, a rejection reads as a
+      # `nil` result and coerces to `0` — a value the caller would then record
+      # as a real KashFlow identifier. See {SUCCESS_STATUS} for why the success
+      # value is a convention rather than a schema-declared enumeration.
+      #
+      # @param body [Hash] the parsed response body
+      # @return [void]
+      # @raise [Spree::Kashflow::AuthenticationError] when the rejection is a
+      #   credentials problem
+      # @raise [Spree::Kashflow::ApiError] for any other non-success `Status`
+      #
+      def assert_status!(body)
+        envelope = body.values.detect { |value| value.is_a?(Hash) }
+        return if envelope.nil?
+
+        status = envelope["Status"]
+        return if status.nil?
+        return if status.to_s.strip.casecmp(SUCCESS_STATUS).zero?
+
+        detail = envelope["StatusDetail"]
+        raise_business_error([status, detail].compact_blank.join(": "))
+      end
+
+      ##
+      # @param message [String] the message KashFlow refused the request with
+      # @return [void]
+      # @raise [Spree::Kashflow::AuthenticationError] when the message names a
+      #   credentials problem
+      # @raise [Spree::Kashflow::ApiError] otherwise
+      #
+      def raise_business_error(message)
+        if message.match?(AUTH_FAULT)
+          raise AuthenticationError, message
+        else
+          raise ApiError, message
+        end
+      end
+
+      ##
+      # KashFlow returns `0` (or nothing at all) where it means "refused", and
+      # a `0` recorded as an identifier is worse than a raised error: it looks
+      # like a successful sync, satisfies the caller's idempotency check, and
+      # blocks every retry.
+      #
+      # @param result [Object, nil] the raw result element
+      # @param label [String] what the identifier is, for the error message
+      # @return [Integer] the identifier
+      # @raise [Spree::Kashflow::ApiError] when the result is nil or zero
+      #
+      def assert_identifier!(result, label)
+        identifier = result.to_i
+        return identifier unless result.nil? || identifier.zero?
+
+        raise ApiError, "KashFlow returned no #{label} (result: #{result.inspect})"
       end
 
       ##

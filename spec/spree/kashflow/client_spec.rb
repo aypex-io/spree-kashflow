@@ -136,6 +136,135 @@ RSpec.describe Spree::Kashflow::Client do
 
       expect(client.create_invoice({"CustomerID" => 1})).to eq(4471)
     end
+
+    it "raises ApiError instead of returning 0 when KashFlow returns no invoice number" do
+      stub_kashflow_call(
+        '<InsertInvoice_TypeDefinedResponse xmlns="KashFlowAPI">' \
+        "<InsertInvoice_TypeDefinedResult>0</InsertInvoice_TypeDefinedResult>" \
+        "</InsertInvoice_TypeDefinedResponse>"
+      )
+
+      expect { client.create_invoice({}) }.to raise_error(Spree::Kashflow::ApiError, /invoice number/)
+    end
+
+    it "raises ApiError when the result element is absent altogether" do
+      stub_kashflow_call('<InsertInvoice_TypeDefinedResponse xmlns="KashFlowAPI" />')
+
+      expect { client.create_invoice({}) }.to raise_error(Spree::Kashflow::ApiError, /invoice number/)
+    end
+  end
+
+  describe "#upsert_customer" do
+    it "returns the KashFlow customer id" do
+      stub_kashflow_call(
+        '<InsertCustomerResponse xmlns="KashFlowAPI">' \
+        "<InsertCustomerResult>555</InsertCustomerResult>" \
+        "</InsertCustomerResponse>"
+      )
+
+      expect(client.upsert_customer({"Code" => "a@b.com"})).to eq(555)
+    end
+
+    it "raises ApiError instead of returning 0 when KashFlow returns no customer id" do
+      stub_kashflow_call(
+        '<InsertCustomerResponse xmlns="KashFlowAPI">' \
+        "<InsertCustomerResult>0</InsertCustomerResult>" \
+        "</InsertCustomerResponse>"
+      )
+
+      expect { client.upsert_customer({}) }.to raise_error(Spree::Kashflow::ApiError, /customer id/)
+    end
+  end
+
+  # The defect these cover: KashFlow reports business-level rejections at HTTP
+  # 200 with an empty result element and a Status/StatusDetail pair beside it.
+  # Uninspected, `nil.to_i` made that a KashFlow identifier of 0 that the job
+  # then recorded as a successful sync.
+  describe "in-band Status handling" do
+    it "raises ApiError carrying StatusDetail when Status is not OK" do
+      stub_kashflow_call(
+        '<InsertInvoice_TypeDefinedResponse xmlns="KashFlowAPI">' \
+        "<InsertInvoice_TypeDefinedResult>0</InsertInvoice_TypeDefinedResult>" \
+        "<Status>ERROR</Status><StatusDetail>Nominal code 9999 does not exist</StatusDetail>" \
+        "</InsertInvoice_TypeDefinedResponse>"
+      )
+
+      expect { client.create_invoice({}) }
+        .to raise_error(Spree::Kashflow::ApiError, /Nominal code 9999 does not exist/)
+    end
+
+    it "raises AuthenticationError when the Status rejection is a credentials problem" do
+      stub_kashflow_call(
+        '<InsertCustomerResponse xmlns="KashFlowAPI">' \
+        "<InsertCustomerResult>0</InsertCustomerResult>" \
+        "<Status>ERROR</Status><StatusDetail>Invalid Username or Password</StatusDetail>" \
+        "</InsertCustomerResponse>"
+      )
+
+      expect { client.upsert_customer({}) }.to raise_error(Spree::Kashflow::AuthenticationError)
+    end
+
+    it "accepts a Status of OK" do
+      stub_kashflow_call(
+        '<InsertInvoice_TypeDefinedResponse xmlns="KashFlowAPI">' \
+        "<InsertInvoice_TypeDefinedResult>4471</InsertInvoice_TypeDefinedResult>" \
+        "<Status>OK</Status><StatusDetail />" \
+        "</InsertInvoice_TypeDefinedResponse>"
+      )
+
+      expect(client.create_invoice({})).to eq(4471)
+    end
+  end
+
+  # The assertion whose absence hid the missing ArrayOfInvoiceLine wrapper: no
+  # other spec in this suite looks at a SOAP request body, only at what the
+  # stubbed response deserialises to.
+  describe "the SOAP request body it actually sends" do
+    it "wraps each line in an <InvoiceLine> element inside <Lines>" do
+      captured = nil
+      stub_request(:post, KashflowSoap::ENDPOINT)
+        .with { |request| captured = request.body }
+        .to_return(
+          status: 200,
+          body: <<~XML,
+            <?xml version="1.0" encoding="utf-8"?>
+            <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+              <soap:Body><InsertInvoice_TypeDefinedResponse xmlns="KashFlowAPI">
+                <InsertInvoice_TypeDefinedResult>4471</InsertInvoice_TypeDefinedResult>
+              </InsertInvoice_TypeDefinedResponse></soap:Body>
+            </soap:Envelope>
+          XML
+          headers: {"Content-Type" => "text/xml; charset=utf-8"}
+        )
+
+      client.create_invoice(
+        "CustomerID" => 1,
+        "Lines" => {"InvoiceLine" => [{"Rate" => 10}, {"Rate" => 20}]}
+      )
+
+      expect(captured).to include(
+        "<tns:Lines><tns:InvoiceLine><tns:Rate>10</tns:Rate></tns:InvoiceLine>" \
+        "<tns:InvoiceLine><tns:Rate>20</tns:Rate></tns:InvoiceLine></tns:Lines>"
+      )
+    end
+
+    it "sends the credentials on every request" do
+      captured = nil
+      stub_request(:post, KashflowSoap::ENDPOINT)
+        .with { |request| captured = request.body }
+        .to_return(
+          status: 200,
+          body: '<?xml version="1.0" encoding="utf-8"?>' \
+                '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>' \
+                '<GetCurrenciesResponse xmlns="KashFlowAPI"><GetCurrenciesResult /></GetCurrenciesResponse>' \
+                "</soap:Body></soap:Envelope>",
+          headers: {"Content-Type" => "text/xml; charset=utf-8"}
+        )
+
+      client.verify_credentials
+
+      expect(captured).to include("<tns:UserName>user</tns:UserName>", "<tns:Password>secret</tns:Password>")
+    end
   end
 
   describe "error mapping" do
@@ -163,6 +292,16 @@ RSpec.describe Spree::Kashflow::Client do
       stub_request(:post, KashflowSoap::ENDPOINT).to_timeout
 
       expect { client.create_invoice({}) }.to raise_error(Spree::Kashflow::TransportError)
+    end
+
+    # A DNS or TLS failure used to bypass TransportError entirely, so the jobs'
+    # `retry_on Spree::Kashflow::TransportError` never fired for either.
+    [SocketError, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, OpenSSL::SSL::SSLError].each do |error_class|
+      it "raises TransportError for #{error_class}" do
+        stub_request(:post, KashflowSoap::ENDPOINT).to_raise(error_class)
+
+        expect { client.create_invoice({}) }.to raise_error(Spree::Kashflow::TransportError)
+      end
     end
   end
 end

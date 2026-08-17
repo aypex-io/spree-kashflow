@@ -70,6 +70,31 @@ RSpec.describe Spree::Kashflow::SyncRefundJob do
         expect(client).to have_received(:apply_credit_note).with(credit_note_number: 4321, invoice_number: 98765)
       end
 
+      # The idempotency key is written after `apply_credit_note` succeeds.
+      # Written before it, a failing link call would leave behind exactly the
+      # unlinked credit note the job's own up-front guard exists to prevent.
+      context "and linking the credit note fails" do
+        before do
+          allow(client).to receive(:apply_credit_note)
+            .and_raise(Spree::Kashflow::ApiError, "invoice 98765 is already fully credited")
+        end
+
+        it "leaves the refund retryable rather than marking it synced" do
+          suppress(Spree::Kashflow::ApiError) { described_class.perform_now(refund.id) }
+
+          expect(refund.reload.has_metafield?(Spree::Kashflow::Metafields::REFUND_CREDIT_NOTE_NUMBER)).to be(false)
+        end
+      end
+
+      it "seeds the refund metafield definition as back-end only" do
+        described_class.perform_now(refund.id)
+
+        definition = Spree::MetafieldDefinition.find_by(
+          namespace: "kashflow", key: "credit_note_number", resource_type: "Spree::Refund"
+        )
+        expect(definition.display_on).to eq("back_end")
+      end
+
       it "emits credit note envelope keys in WSDL sequence order" do
         captured = nil
         allow(client).to receive(:create_invoice) { |payload|
@@ -82,8 +107,21 @@ RSpec.describe Spree::Kashflow::SyncRefundJob do
         expect(captured.keys).to eq(%w[
           InvoiceDBID InvoiceNumber InvoiceDate DueDate CustomerID Paid CustomerReference
           SuppressTotal ProjectID CurrencyCode ExchangeRate Lines NetAmount VATAmount AmountPaid
-          UseCustomDeliveryAddress CISRCNetAmount CISRCVatAmount IsCISReverseCharge
+          CISRCNetAmount CISRCVatAmount IsCISReverseCharge
         ])
+      end
+
+      it "wraps the credit note lines in the ArrayOfInvoiceLine element the WSDL declares" do
+        captured = nil
+        allow(client).to receive(:create_invoice) { |payload|
+          captured = payload
+          4321
+        }
+
+        described_class.perform_now(refund.id)
+
+        expect(captured["Lines"].keys).to eq(["InvoiceLine"])
+        expect(captured["Lines"]["InvoiceLine"]).to all(include("Rate"))
       end
 
       it "sets the schema-required tail fields to arithmetically neutral defaults" do
@@ -95,8 +133,8 @@ RSpec.describe Spree::Kashflow::SyncRefundJob do
 
         described_class.perform_now(refund.id)
 
-        expect(captured.values_at("UseCustomDeliveryAddress", "CISRCNetAmount", "CISRCVatAmount", "IsCISReverseCharge"))
-          .to eq([false, 0, 0, false])
+        expect(captured.values_at("CISRCNetAmount", "CISRCVatAmount", "IsCISReverseCharge"))
+          .to eq([0, 0, false])
       end
     end
 

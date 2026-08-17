@@ -35,7 +35,7 @@ module Spree
 
         sync(refund, order, integration)
       rescue Spree::Kashflow::Error => e
-        order.set_metafield(Metafields::ORDER_SYNC_ERROR, e.message)
+        Metafields.write(order, Metafields::ORDER_SYNC_ERROR, e.message)
         raise
       end
 
@@ -65,10 +65,15 @@ module Spree
         customer_id = client.upsert_customer(CustomerPayload.new(order).to_h)
 
         credit_note_number = client.create_invoice(credit_note_envelope(refund, order, integration, customer_id))
-        refund.set_metafield(Metafields::REFUND_CREDIT_NOTE_NUMBER, credit_note_number)
 
         invoice_number = order.get_metafield(CreditNotePayload::INVOICE_NUMBER_METAFIELD_KEY).value.to_i
         client.apply_credit_note(credit_note_number: credit_note_number, invoice_number: invoice_number)
+
+        # Written last, after `apply_credit_note` has succeeded. Written before
+        # it, a failing link call would leave behind exactly the unlinked credit
+        # note the guard above exists to prevent — and the idempotency check
+        # would then no-op every retry.
+        Metafields.write(refund, Metafields::REFUND_CREDIT_NOTE_NUMBER, credit_note_number)
       end
 
       ##
@@ -78,10 +83,10 @@ module Spree
       # needs the same `minOccurs="1"` fields. `Paid`/`AmountPaid` are `0`: a
       # credit note is not itself a payment, it is linked to the original invoice
       # separately via `applyCreditNoteToInvoice`. See
-      # {SyncOrderJob#invoice_envelope} for the rationale behind
-      # `UseCustomDeliveryAddress` and the CIS reverse-charge trio (UK
-      # Construction Industry Scheme fields, structurally required but not
-      # applicable to this integration).
+      # {SyncOrderJob#invoice_envelope} for the rationale behind the
+      # `ArrayOfInvoiceLine` wrapper around `Lines` and the CIS reverse-charge
+      # trio (UK Construction Industry Scheme fields, structurally required but
+      # not applicable to this integration).
       #
       # @param refund [Spree::Refund]
       # @param order [Spree::Order]
@@ -106,11 +111,10 @@ module Spree
           "ProjectID" => 0,
           "CurrencyCode" => payload["CurrencyCode"],
           "ExchangeRate" => BigDecimal(1),
-          "Lines" => payload["Lines"],
+          "Lines" => {"InvoiceLine" => payload["Lines"]},
           "NetAmount" => payload["NetAmount"],
           "VATAmount" => payload["VATAmount"],
           "AmountPaid" => BigDecimal(0),
-          "UseCustomDeliveryAddress" => false,
           "CISRCNetAmount" => 0,
           "CISRCVatAmount" => 0,
           "IsCISReverseCharge" => false

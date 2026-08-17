@@ -40,13 +40,21 @@ module Spree
 
         sync(order, integration)
       rescue Spree::Kashflow::Error => e
-        order.set_metafield(Metafields::ORDER_SYNC_ERROR, e.message)
+        Metafields.write(order, Metafields::ORDER_SYNC_ERROR, e.message)
         raise
       end
 
       private
 
       ##
+      # Every KashFlow call this job makes happens before any metafield is
+      # written, and {Metafields::ORDER_INVOICE_NUMBER} — the idempotency key —
+      # is written last of all. Writing it earlier makes a failure in a
+      # follow-on call (a wrong `PayAccount` rejecting the payment, say)
+      # unrecoverable: the retry sees the key, no-ops, and the invoice stays
+      # unpaid in KashFlow forever. Written last, a failed follow-on leaves the
+      # order retryable.
+      #
       # @param order [Spree::Order]
       # @param integration [Spree::Integrations::Kashflow]
       # @return [void]
@@ -56,15 +64,13 @@ module Spree
         assert_currency_enabled!(order, client)
 
         customer_id = client.upsert_customer(CustomerPayload.new(order).to_h)
-        order.set_metafield(Metafields::ORDER_CUSTOMER_CODE, customer_id)
-
         invoice_number = client.create_invoice(invoice_envelope(order, integration, customer_id))
-        order.set_metafield(Metafields::ORDER_INVOICE_NUMBER, invoice_number)
-
         record_payment(order, integration, client, invoice_number) if order.paid?
 
-        order.set_metafield(Metafields::ORDER_SYNCED_AT, Time.current)
-        order.set_metafield(Metafields::ORDER_SYNC_ERROR, nil)
+        Metafields.write(order, Metafields::ORDER_CUSTOMER_CODE, customer_id)
+        Metafields.write(order, Metafields::ORDER_SYNCED_AT, Time.current)
+        Metafields.write(order, Metafields::ORDER_SYNC_ERROR, nil)
+        Metafields.write(order, Metafields::ORDER_INVOICE_NUMBER, invoice_number)
       end
 
       ##
@@ -89,9 +95,17 @@ module Spree
       # complex type also declares `minOccurs="1"`, which Task 5 deliberately left
       # to this job because they depend on things Task 5's mapper doesn't have: the
       # customer id from the upsert call, and this job's own idempotency/payment
-      # state. Keys are emitted in WSDL `<s:sequence>` order — Savon serialises a
-      # Hash body in insertion order, and a .NET ASMX endpoint enforcing that
-      # sequence drops or mis-binds an out-of-order element rather than raising.
+      # state. Keys are emitted in `Invoice_TypeDefined`'s WSDL `<s:sequence>`
+      # order — Savon serialises a Hash body in insertion order, and a .NET ASMX
+      # endpoint enforcing that sequence drops or mis-binds an out-of-order
+      # element rather than raising.
+      #
+      # `Lines` is nested under an explicit `"InvoiceLine"` key because the WSDL
+      # types it as `ArrayOfInvoiceLine`, whose single member is an unbounded
+      # `InvoiceLine` element. Handing Gyoku a bare Array instead repeats
+      # `<Lines>` as a sibling per line rather than wrapping them, which an ASMX
+      # `XmlSerializer` skips as unknown children — posting an invoice with
+      # header totals and no lines, and still returning an invoice number.
       #
       # Defaults for the fields with no natural source:
       # - `InvoiceDBID`, `InvoiceNumber`: unknown before KashFlow assigns them on
@@ -103,8 +117,8 @@ module Spree
       # - `ExchangeRate`: `1` — {#assert_currency_enabled!} has already refused to
       #   post an order whose currency isn't one KashFlow itself is configured
       #   for, so no conversion applies.
-      # - `UseCustomDeliveryAddress`: `false` — no delivery address override is
-      #   sent, so this stays off.
+      # - `CustomerReference`: the Spree order number, so an accountant
+      #   reconciling a discrepancy in KashFlow can find the order it came from.
       # - `CISRCNetAmount`, `CISRCVatAmount`, `IsCISReverseCharge`: UK Construction
       #   Industry Scheme reverse-charge fields. Structurally required by the
       #   schema but not applicable to this integration (a supplements retailer,
@@ -131,15 +145,15 @@ module Spree
           "DueDate" => invoice_date,
           "CustomerID" => customer_id,
           "Paid" => order.paid? ? 1 : 0,
+          "CustomerReference" => order.number,
           "SuppressTotal" => 0,
           "ProjectID" => 0,
           "CurrencyCode" => payload["CurrencyCode"],
           "ExchangeRate" => BigDecimal(1),
-          "Lines" => payload["Lines"],
+          "Lines" => {"InvoiceLine" => payload["Lines"]},
           "NetAmount" => payload["NetAmount"],
           "VATAmount" => payload["VATAmount"],
           "AmountPaid" => order.paid? ? order.total : BigDecimal(0),
-          "UseCustomDeliveryAddress" => false,
           "CISRCNetAmount" => 0,
           "CISRCVatAmount" => 0,
           "IsCISReverseCharge" => false
