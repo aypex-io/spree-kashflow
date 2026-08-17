@@ -31,6 +31,13 @@ module Spree
       end
 
       ##
+      # Keys are emitted in the WSDL `Customer` `<s:sequence>`'s relative order —
+      # `… Address4, CountryName, CountryCode, Postcode, Website, EC, OutsideEC,
+      # … ContactFirstName, ContactLastName, … VATNumber`. Savon serialises a
+      # Hash body in insertion order, and a .NET ASMX endpoint enforcing that
+      # sequence drops or mis-binds an out-of-order element rather than raising,
+      # so the order of these keys is load-bearing, not cosmetic.
+      #
       # @return [Hash{String => Object}] a KashFlow `Customer` structure keyed by the
       #   WSDL field names, ready to hand to KashFlow's customer-upsert operation
       #
@@ -39,16 +46,16 @@ module Spree
           "Code" => order.email,
           "Name" => customer_name,
           "Email" => order.email,
-          "Address1" => bill_address.address1,
-          "Address2" => bill_address.address2,
-          "Address3" => bill_address.city,
-          "Address4" => bill_address.state_name_text,
-          "Postcode" => bill_address.zipcode,
+          "Address1" => bill_address&.address1,
+          "Address2" => bill_address&.address2,
+          "Address3" => bill_address&.city,
+          "Address4" => bill_address&.state_name_text,
           "CountryCode" => billing_country_code,
-          "ContactFirstName" => bill_address.firstname,
-          "ContactLastName" => bill_address.lastname,
+          "Postcode" => bill_address&.zipcode,
           "EC" => ec_flag,
-          "OutsideEC" => outside_ec_flag
+          "OutsideEC" => outside_ec_flag,
+          "ContactFirstName" => bill_address&.firstname,
+          "ContactLastName" => bill_address&.lastname
         }
         payload["VATNumber"] = vat_number if vat_number.present?
         payload
@@ -60,7 +67,13 @@ module Spree
       attr_reader :order
 
       ##
-      # @return [Spree::Address] the order's billing address
+      # Nullable on purpose. A digital-only order can complete with no billing
+      # address at all, and a `NoMethodError` here would escape the sync job's
+      # `Spree::Kashflow::Error` rescue entirely — failing with no
+      # `kashflow.sync_error` recorded. Every caller navigates this safely and
+      # sends the address fields as absent instead.
+      #
+      # @return [Spree::Address, nil] the order's billing address, when it has one
       #
       def bill_address
         order.bill_address
@@ -71,18 +84,19 @@ module Spree
       # contact person on the order. The billing company stands in for the former when
       # present; an individual buyer's name is used otherwise.
       #
-      # @return [String] the billing company name, or the billing full name when there
-      #   is no company
+      # @return [String, nil] the billing company name, the billing full name when
+      #   there is no company, or the order's email when there is no billing
+      #   address at all
       #
       def customer_name
-        bill_address.company.presence || bill_address.full_name
+        bill_address&.company.presence || bill_address&.full_name.presence || order.email
       end
 
       ##
       # @return [String, nil] the billing address's ISO 3166-1 alpha-2 country code
       #
       def billing_country_code
-        bill_address.country&.iso
+        bill_address&.country&.iso
       end
 
       ##

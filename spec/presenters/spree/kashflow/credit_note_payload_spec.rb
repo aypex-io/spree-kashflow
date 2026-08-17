@@ -87,6 +87,36 @@ RSpec.describe Spree::Kashflow::CreditNotePayload do
       end
     end
 
+    # `blended_vat_rate` divides by (order.total - order.included_tax_total).
+    # ZeroDivisionError is not a Spree::Kashflow::Error, so left unguarded it
+    # would escape SyncRefundJob's rescue entirely and the refund would fail
+    # with no kashflow.sync_error recorded anywhere.
+    context "when the order's total is entirely VAT, leaving no net to divide by" do
+      let(:order) do
+        instance_double(
+          Spree::Order,
+          currency: "USD",
+          total: BigDecimal("10.00"),
+          included_tax_total: BigDecimal("10.00")
+        )
+      end
+
+      let(:refund) do
+        instance_double(Spree::Refund, order: order, amount: BigDecimal("5.00"),
+          reason: instance_double(Spree::RefundReason, name: "Goodwill"))
+      end
+
+      before { allow(order).to receive(:get_metafield).and_return(nil) }
+
+      it "does not raise ZeroDivisionError" do
+        expect { payload.to_h }.not_to raise_error
+      end
+
+      it "falls back to a zero VAT rate" do
+        expect(payload.to_h["Lines"].first["VatRate"]).to eq(0)
+      end
+    end
+
     context "with a partial refund" do
       let(:refund) { build_refund(BigDecimal("24.00")) }
 

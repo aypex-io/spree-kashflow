@@ -104,7 +104,27 @@ RSpec.describe Spree::Kashflow::InvoicePayload do
 
       line_item = line_item_for(standard_product)
       line = payload.lines.find { |l| l["Description"].start_with?(line_item.name) }
-      expect(line["Description"]).to eq("#{line_item.name} (#{promotion.code} applied)")
+      # Upcased because the annotation now comes from `Promotion#name_for_order`,
+      # which upcases; `#code` is nil for automatic and multi-code promotions.
+      expect(line["Description"]).to eq("#{line_item.name} (#{promotion.code.upcase} applied)")
+    end
+
+    it "names an automatic promotion in the description, which carries no code" do
+      promotion = create(:promotion, store: store, name: "Autumn sale", kind: "automatic")
+      Spree::Promotion::Actions::CreateItemAdjustments.create!(
+        promotion: promotion,
+        calculator: Spree::Calculator::FlatRate.new(preferred_amount: 10, preferred_currency: "USD")
+      )
+      promotion.actions.each { |action| action.perform(order: order, promotion: promotion) }
+      order.reload
+      order.update_with_updater!
+      order.reload
+
+      expect(promotion.reload.code).to be_nil
+
+      line_item = line_item_for(standard_product)
+      line = payload.lines.find { |l| l["Description"].start_with?(line_item.name) }
+      expect(line["Description"]).to eq("#{line_item.name} (AUTUMN SALE applied)")
     end
 
     it "does not name a promotion in the description when none applies" do
@@ -261,6 +281,64 @@ RSpec.describe Spree::Kashflow::InvoicePayload do
         result = payload.to_h
         assembled = result["NetAmount"] + result["VATAmount"]
         expect(assembled).to eq(order.total)
+      end
+    end
+
+    # Regression for the three-line case. `taxable_basis` allocates a whole-order
+    # discount across the lines unrounded, so each of three £10 lines gets a
+    # basis of 8.333333…; rounded per line that assembles to 24.99 against an
+    # order.total of 25.00, and the guard raised permanently. With TWO lines the
+    # residues cancel exactly, which is why the single- and two-line fixtures
+    # above passed for the wrong reason. Three is the smallest count that
+    # actually exercises the allocation.
+    context "when an order-level promotion leaves a penny residue across three lines" do
+      let(:order) do
+        order = create(:order_with_line_items, store: store, currency: "USD", line_items_count: 0,
+          ship_address: create(:address), shipment_cost: 0)
+        3.times do
+          create(:line_item, order: order, variant: create(:product, price: 10, tax_category: nil).master,
+            price: 10, quantity: 1, currency: "USD")
+        end
+        order.reload
+        order.update_with_updater!
+        order.reload
+      end
+
+      before do
+        promotion = create(:promotion, store: store, name: "Order-level fiver off")
+        Spree::Promotion::Actions::CreateAdjustment.create!(
+          promotion: promotion,
+          calculator: Spree::Calculator::FlatRate.new(preferred_amount: 5, preferred_currency: "USD")
+        )
+        promotion.actions.each { |action| action.perform(order: order) }
+        order.reload
+        order.update_with_updater!
+        order.reload
+      end
+
+      it "has three lines, a £5 order-level discount and a £25 total (fixture precondition)" do
+        expect(order.line_items.length).to eq(3)
+        expect(order.adjustment_total).to eq(BigDecimal("-5"))
+        expect(order.total).to eq(BigDecimal(25))
+      end
+
+      it "does not raise TotalMismatchError" do
+        expect { payload.to_h }.not_to raise_error
+      end
+
+      it "pushes the residual penny onto one line rather than losing it" do
+        lines = payload.to_h["Lines"]
+        product_rates = lines
+          .reject { |line| line["Description"] == described_class::SHIPPING_DESCRIPTION }
+          .map { |line| line["Rate"] }
+
+        expect(lines.sum { |line| line["Rate"] }).to eq(BigDecimal(25))
+        expect(product_rates.sort).to eq([BigDecimal("8.33"), BigDecimal("8.33"), BigDecimal("8.34")])
+      end
+
+      it "produces a payload whose assembled total reconciles with order.total" do
+        result = payload.to_h
+        expect(result["NetAmount"] + result["VATAmount"]).to eq(order.total)
       end
     end
   end

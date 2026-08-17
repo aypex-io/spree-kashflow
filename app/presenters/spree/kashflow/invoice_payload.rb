@@ -89,6 +89,47 @@ module Spree
         entries = order.line_items.map { |line_item| line_item_entry(line_item) } +
           order.shipments.map { |shipment| shipment_entry(shipment) }
         entries.each_with_index { |entry, index| entry[:line]["Sort"] = index + 1 }
+        allocate_rounding_residue!(entries)
+        entries
+      end
+
+      ##
+      # Largest-remainder penny allocation, run before the guard.
+      #
+      # `taxable_basis` returns an unrounded figure whenever a whole-order
+      # promotion applies: the discount is allocated across lines, so each
+      # line's share carries a fractional residue that only cancels when the
+      # whole set is summed. Three £10 lines with a £5 order-level discount give
+      # each line a basis of `8.333333…`, which rounds to `8.33` and assembles
+      # to `24.99` against an `order.total` of `25.00`. With two lines the
+      # residues happen to cancel, which is why this went unnoticed.
+      #
+      # Rather than loosen the guard — exact equality is the point of it — each
+      # entry's net total is rounded to the penny here and the leftover penny or
+      # two is pushed onto the largest line, the conventional allocation and the
+      # one where a penny is proportionally least visible.
+      #
+      # Only genuine rounding noise is absorbed: the residue is left alone (and
+      # the guard therefore still raises) once it exceeds one penny per line.
+      # That bound is what keeps the exclusive-tax case a refusal rather than a
+      # silent mis-booking — an order carrying `additional_tax_total` misses by
+      # the whole tax amount, not by pennies.
+      #
+      # @param entries [Array<Hash{Symbol => Object}>]
+      # @return [Array<Hash{Symbol => Object}>] the same entries, mutated in place
+      #
+      def allocate_rounding_residue!(entries)
+        return entries if entries.empty?
+
+        target = (order.total - entries.sum { |entry| entry[:line]["VatAmount"] }).round(2)
+        entries.each { |entry| entry[:net_total] = entry[:net_total].round(2) }
+        residue = target - entries.sum { |entry| entry[:net_total] }
+
+        if residue.nonzero? && residue.abs <= entries.length * BigDecimal("0.01")
+          entries.max_by { |entry| entry[:net_total].abs }[:net_total] += residue
+        end
+
+        entries.each { |entry| entry[:line]["Rate"] = (entry[:net_total] / entry[:line]["Quantity"]).round(4) }
         entries
       end
 
@@ -174,21 +215,29 @@ module Spree
       ##
       # @param line_item [Spree::LineItem]
       # @return [String] the product name, suffixed with the applied promotion
-      #   codes when any eligible promotion adjustment applies to this line
+      #   names when any eligible promotion adjustment applies to this line
       #
       def line_item_description(line_item)
-        codes = promotion_codes(line_item)
-        return line_item.name if codes.empty?
-        "#{line_item.name} (#{codes.join(", ")} applied)"
+        names = promotion_names(line_item)
+        return line_item.name if names.empty?
+        "#{line_item.name} (#{names.join(", ")} applied)"
       end
 
       ##
-      # @param line_item [Spree::LineItem]
-      # @return [Array<String>] the codes of eligible promotions applied to this line
+      # Uses `Spree::Promotion#name_for_order`, not `#code`. `code` is nilled out
+      # by a `before_validation` for *both* `multi_codes?` and `automatic?`
+      # promotions (spree_core `app/models/spree/promotion.rb:49`), so reading it
+      # directly drops the annotation entirely for automatic discounts — the
+      # common case. `name_for_order` returns the order's actual coupon code for
+      # a coupon promotion and the promotion's name otherwise.
       #
-      def promotion_codes(line_item)
+      # @param line_item [Spree::LineItem]
+      # @return [Array<String>] the names (or codes) of eligible promotions
+      #   applied to this line
+      #
+      def promotion_names(line_item)
         line_item.adjustments.select(&:promotion?).select(&:eligible?)
-          .map { |adjustment| adjustment.source.promotion.code }
+          .map { |adjustment| adjustment.source.promotion.name_for_order(order).presence }
           .compact.uniq
       end
 
@@ -196,6 +245,10 @@ module Spree
       # The correctness guard. Raises rather than returns a payload whose figures
       # do not reconcile — a failed sync is a queryable flag, a wrong invoice is a
       # discrepancy someone finds at year end.
+      #
+      # Exact equality is deliberate and must stay that way. Penny residue from a
+      # whole-order promotion is dealt with upstream in
+      # {#allocate_rounding_residue!}, not by widening the comparison here.
       #
       # @note Known limitation: this guard only accounts for VAT baked into the
       #   price (`included_tax_total`) and the whole-order allocation captured by

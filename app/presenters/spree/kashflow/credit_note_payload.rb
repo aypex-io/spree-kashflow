@@ -152,11 +152,20 @@ module Spree
       # ratio across the refunded amount rather than deriving it from specific
       # lines.
       #
+      # Returns zero when there is no net to divide by — an order whose total is
+      # entirely VAT, or a zero-total order. Guarded rather than left to raise:
+      # `ZeroDivisionError` is not a {Spree::Kashflow::Error}, so it would escape
+      # {SyncRefundJob}'s rescue and the refund would fail with no
+      # `kashflow.sync_error` recorded anywhere.
+      #
       # @return [BigDecimal] the order's blended VAT rate, expressed as a
       #   fraction of net (not a percentage)
       #
       def blended_vat_rate
-        order.included_tax_total / (order.total - order.included_tax_total)
+        net = order.total - order.included_tax_total
+        return BigDecimal(0) if net.zero?
+
+        order.included_tax_total / net
       end
 
       ##

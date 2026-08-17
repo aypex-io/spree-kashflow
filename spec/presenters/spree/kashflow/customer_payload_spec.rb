@@ -27,6 +27,47 @@ RSpec.describe Spree::Kashflow::CustomerPayload do
   end
 
   describe "#to_h" do
+    # Savon serialises a Hash body in insertion order and a .NET ASMX endpoint
+    # enforcing <s:sequence> drops or mis-binds an out-of-order element rather
+    # than raising, so this ordering is load-bearing. Relative order taken
+    # directly from the vendored WSDL's `Customer` complex type: … Address4,
+    # CountryName, CountryCode, Postcode, Website, EC, OutsideEC, …
+    # ContactFirstName, ContactLastName, … VATNumber.
+    it "emits keys in WSDL sequence order" do
+      expect(payload.to_h.keys).to eq(%w[
+        Code Name Email Address1 Address2 Address3 Address4 CountryCode Postcode
+        EC OutsideEC ContactFirstName ContactLastName
+      ])
+    end
+
+    context "with a VAT number in order metadata" do
+      let(:order) do
+        build_stubbed(:order, email: "ada@example.com", bill_address: bill_address, store: store,
+          metadata: {"vat_number" => "GB123456789"})
+      end
+
+      it "appends VATNumber last, where the sequence declares it" do
+        expect(payload.to_h.keys.last).to eq("VATNumber")
+      end
+    end
+
+    context "when the order has no billing address" do
+      let(:order) { build_stubbed(:order, email: "ada@example.com", bill_address: nil, store: store) }
+
+      it "sends the address fields as absent instead of raising NoMethodError" do
+        expect(payload.to_h).to include(
+          "Address1" => nil,
+          "Postcode" => nil,
+          "CountryCode" => nil,
+          "ContactFirstName" => nil
+        )
+      end
+
+      it "falls back to the order email for Name" do
+        expect(payload.to_h["Name"]).to eq("ada@example.com")
+      end
+    end
+
     it "maps the billing address into the KashFlow address fields" do
       expect(payload.to_h).to include(
         "Address1" => "12 Mercer Street",
