@@ -70,7 +70,7 @@ module Spree
       #   `options_for_select`; empty when credentials are absent or the lookup fails
       #
       def nominal_code_options
-        options_from { client.nominal_codes }
+        @nominal_code_options ||= options_from { client.nominal_codes }
       end
 
       ##
@@ -78,7 +78,15 @@ module Spree
       #   `options_for_select`; empty when credentials are absent or the lookup fails
       #
       def bank_account_options
-        options_from { client.bank_accounts }
+        @bank_account_options ||= options_from { client.bank_accounts }
+      end
+
+      ##
+      # @return [Array<Array(String, Integer)>] invoice payment method `[name, id]` pairs for
+      #   `options_for_select`; empty when credentials are absent or the lookup fails
+      #
+      def payment_method_options
+        @payment_method_options ||= options_from { client.payment_methods }
       end
 
       private

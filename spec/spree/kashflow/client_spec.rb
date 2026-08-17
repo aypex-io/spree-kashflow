@@ -95,6 +95,37 @@ RSpec.describe Spree::Kashflow::Client do
     end
   end
 
+  describe "#payment_methods" do
+    it "returns each payment method as a hash with coerced types" do
+      stub_kashflow_call(
+        '<GetInvPayMethodsResponse xmlns="KashFlowAPI"><GetInvPayMethodsResult>' \
+        "<PaymentMethod><MethodID>1</MethodID><MethodName>Bank Transfer</MethodName></PaymentMethod>" \
+        "<PaymentMethod><MethodID>2</MethodID><MethodName>Credit Card</MethodName></PaymentMethod>" \
+        "</GetInvPayMethodsResult></GetInvPayMethodsResponse>"
+      )
+
+      expect(client.payment_methods).to eq(
+        [{id: 1, name: "Bank Transfer"}, {id: 2, name: "Credit Card"}]
+      )
+    end
+
+    it "returns a one-element array when KashFlow has a single payment method" do
+      stub_kashflow_call(
+        '<GetInvPayMethodsResponse xmlns="KashFlowAPI"><GetInvPayMethodsResult>' \
+        "<PaymentMethod><MethodID>1</MethodID><MethodName>Bank Transfer</MethodName></PaymentMethod>" \
+        "</GetInvPayMethodsResult></GetInvPayMethodsResponse>"
+      )
+
+      expect(client.payment_methods).to eq([{id: 1, name: "Bank Transfer"}])
+    end
+
+    it "returns an empty array when KashFlow has no payment methods" do
+      stub_kashflow_call('<GetInvPayMethodsResponse xmlns="KashFlowAPI"><GetInvPayMethodsResult /></GetInvPayMethodsResponse>')
+
+      expect(client.payment_methods).to eq([])
+    end
+  end
+
   describe "#create_invoice" do
     it "returns the invoice number KashFlow assigned" do
       stub_kashflow_call(

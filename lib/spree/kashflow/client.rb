@@ -67,6 +67,15 @@ module Spree
       end
 
       ##
+      # @return [Array<Hash>] invoice payment methods as `{id:, name:}` hashes
+      # @raise [Spree::Kashflow::Error] when the request fails
+      #
+      def payment_methods
+        rows = extract_rows(call(:get_inv_pay_methods), "GetInvPayMethodsResponse", "GetInvPayMethodsResult", "PaymentMethod")
+        rows.map { |row| {id: row["MethodID"].to_i, name: row["MethodName"]} }
+      end
+
+      ##
       # Creates or updates a customer in KashFlow.
       #
       # @param payload [Hash] a KashFlow `Customer` structure

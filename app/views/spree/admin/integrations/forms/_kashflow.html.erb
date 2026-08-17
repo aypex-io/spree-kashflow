@@ -11,6 +11,8 @@
     <%= content_tag(:div, form.label("preferred_bank_account_id", Spree.t(:bank_account_id, scope: "admin.integrations.kashflow")) +
       form.select("preferred_bank_account_id", options_for_select(@integration.bank_account_options, @integration.preferred_bank_account_id)),
       class: "form-group", id: "spree-integrations-kashflow-preference-bank_account_id") %>
-    <%= preference_field(@integration, form, 'payment_method_id', i18n_scope: 'admin.integrations.kashflow') %>
+    <%= content_tag(:div, form.label("preferred_payment_method_id", Spree.t(:payment_method_id, scope: "admin.integrations.kashflow")) +
+      form.select("preferred_payment_method_id", options_for_select(@integration.payment_method_options, @integration.preferred_payment_method_id)),
+      class: "form-group", id: "spree-integrations-kashflow-preference-payment_method_id") %>
   </div>
 </div>
