@@ -2,9 +2,15 @@
   <div class="col-12">
     <%= preference_field(@integration, form, 'username', i18n_scope: 'admin.integrations.kashflow') %>
     <%= preference_field(@integration, form, 'password', i18n_scope: 'admin.integrations.kashflow') %>
-    <%= preference_field(@integration, form, 'sales_nominal_code', i18n_scope: 'admin.integrations.kashflow') %>
-    <%= preference_field(@integration, form, 'shipping_nominal_code', i18n_scope: 'admin.integrations.kashflow') %>
-    <%= preference_field(@integration, form, 'bank_account_id', i18n_scope: 'admin.integrations.kashflow') %>
+    <%= content_tag(:div, form.label("preferred_sales_nominal_code", Spree.t(:sales_nominal_code, scope: "admin.integrations.kashflow")) +
+      form.select("preferred_sales_nominal_code", options_for_select(@integration.nominal_code_options, @integration.preferred_sales_nominal_code)),
+      class: "form-group", id: "spree-integrations-kashflow-preference-sales_nominal_code") %>
+    <%= content_tag(:div, form.label("preferred_shipping_nominal_code", Spree.t(:shipping_nominal_code, scope: "admin.integrations.kashflow")) +
+      form.select("preferred_shipping_nominal_code", options_for_select(@integration.nominal_code_options, @integration.preferred_shipping_nominal_code)),
+      class: "form-group", id: "spree-integrations-kashflow-preference-shipping_nominal_code") %>
+    <%= content_tag(:div, form.label("preferred_bank_account_id", Spree.t(:bank_account_id, scope: "admin.integrations.kashflow")) +
+      form.select("preferred_bank_account_id", options_for_select(@integration.bank_account_options, @integration.preferred_bank_account_id)),
+      class: "form-group", id: "spree-integrations-kashflow-preference-bank_account_id") %>
     <%= preference_field(@integration, form, 'payment_method_id', i18n_scope: 'admin.integrations.kashflow') %>
   </div>
 </div>

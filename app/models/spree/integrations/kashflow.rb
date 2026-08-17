@@ -64,6 +64,41 @@ module Spree
       def client
         Spree::Kashflow::Client.new(username: preferred_username, password: preferred_password)
       end
+
+      ##
+      # @return [Array<Array(String, Integer)>] nominal code `[name, id]` pairs for
+      #   `options_for_select`; empty when credentials are absent or the lookup fails
+      #
+      def nominal_code_options
+        options_from { client.nominal_codes }
+      end
+
+      ##
+      # @return [Array<Array(String, Integer)>] bank account `[name, id]` pairs for
+      #   `options_for_select`; empty when credentials are absent or the lookup fails
+      #
+      def bank_account_options
+        options_from { client.bank_accounts }
+      end
+
+      private
+
+      ##
+      # Fetches rows from KashFlow and maps them to `options_for_select` pairs. Degrades to an
+      # empty array whenever the dropdown can't be trusted: credentials not yet entered (the
+      # client is never built in that case) or the connected account rejecting or failing the
+      # request — an admin opening this form must always see it render, not a 500.
+      #
+      # @yieldreturn [Array<Hash>] rows as `{id:, name:}` hashes
+      # @return [Array<Array(String, Integer)>]
+      #
+      def options_from
+        return [] if preferred_username.blank? || preferred_password.blank?
+
+        yield.map { |row| [row[:name], row[:id]] }
+      rescue Spree::Kashflow::Error
+        []
+      end
     end
   end
 end
