@@ -103,6 +103,16 @@ module Spree
       # - `ExchangeRate`: `1` — {#assert_currency_enabled!} has already refused to
       #   post an order whose currency isn't one KashFlow itself is configured
       #   for, so no conversion applies.
+      # - `UseCustomDeliveryAddress`: `false` — no delivery address override is
+      #   sent, so this stays off.
+      # - `CISRCNetAmount`, `CISRCVatAmount`, `IsCISReverseCharge`: UK Construction
+      #   Industry Scheme reverse-charge fields. Structurally required by the
+      #   schema but not applicable to this integration (a supplements retailer,
+      #   not a CIS contractor), so `0` / `false` rather than `nil` — `nil` would
+      #   depend on Gyoku emitting `xsi:nil="true"` and the ASMX deserialiser
+      #   accepting it, an assumption no spec here can exercise since every spec
+      #   stubs the SOAP layer. `0` is arithmetically neutral and unambiguous on
+      #   the wire; revisit if a sandbox call ever shows KashFlow prefers null.
       #
       # @param order [Spree::Order]
       # @param integration [Spree::Integrations::Kashflow]
@@ -128,7 +138,11 @@ module Spree
           "Lines" => payload["Lines"],
           "NetAmount" => payload["NetAmount"],
           "VATAmount" => payload["VATAmount"],
-          "AmountPaid" => order.paid? ? order.total : BigDecimal(0)
+          "AmountPaid" => order.paid? ? order.total : BigDecimal(0),
+          "UseCustomDeliveryAddress" => false,
+          "CISRCNetAmount" => 0,
+          "CISRCVatAmount" => 0,
+          "IsCISReverseCharge" => false
         }
       end
 

@@ -77,7 +77,11 @@ module Spree
       # the same `InsertInvoice_TypeDefined` operation as a real invoice, so it
       # needs the same `minOccurs="1"` fields. `Paid`/`AmountPaid` are `0`: a
       # credit note is not itself a payment, it is linked to the original invoice
-      # separately via `applyCreditNoteToInvoice`.
+      # separately via `applyCreditNoteToInvoice`. See
+      # {SyncOrderJob#invoice_envelope} for the rationale behind
+      # `UseCustomDeliveryAddress` and the CIS reverse-charge trio (UK
+      # Construction Industry Scheme fields, structurally required but not
+      # applicable to this integration).
       #
       # @param refund [Spree::Refund]
       # @param order [Spree::Order]
@@ -105,7 +109,11 @@ module Spree
           "Lines" => payload["Lines"],
           "NetAmount" => payload["NetAmount"],
           "VATAmount" => payload["VATAmount"],
-          "AmountPaid" => BigDecimal(0)
+          "AmountPaid" => BigDecimal(0),
+          "UseCustomDeliveryAddress" => false,
+          "CISRCNetAmount" => 0,
+          "CISRCVatAmount" => 0,
+          "IsCISReverseCharge" => false
         }
       end
     end

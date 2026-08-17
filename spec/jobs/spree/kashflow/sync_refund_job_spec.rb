@@ -69,6 +69,35 @@ RSpec.describe Spree::Kashflow::SyncRefundJob do
 
         expect(client).to have_received(:apply_credit_note).with(credit_note_number: 4321, invoice_number: 98765)
       end
+
+      it "emits credit note envelope keys in WSDL sequence order" do
+        captured = nil
+        allow(client).to receive(:create_invoice) { |payload|
+          captured = payload
+          4321
+        }
+
+        described_class.perform_now(refund.id)
+
+        expect(captured.keys).to eq(%w[
+          InvoiceDBID InvoiceNumber InvoiceDate DueDate CustomerID Paid CustomerReference
+          SuppressTotal ProjectID CurrencyCode ExchangeRate Lines NetAmount VATAmount AmountPaid
+          UseCustomDeliveryAddress CISRCNetAmount CISRCVatAmount IsCISReverseCharge
+        ])
+      end
+
+      it "sets the schema-required tail fields to arithmetically neutral defaults" do
+        captured = nil
+        allow(client).to receive(:create_invoice) { |payload|
+          captured = payload
+          4321
+        }
+
+        described_class.perform_now(refund.id)
+
+        expect(captured.values_at("UseCustomDeliveryAddress", "CISRCNetAmount", "CISRCVatAmount", "IsCISReverseCharge"))
+          .to eq([false, 0, 0, false])
+      end
     end
 
     context "when the order has no KashFlow invoice number" do

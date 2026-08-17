@@ -57,6 +57,35 @@ RSpec.describe Spree::Kashflow::SyncOrderJob do
       expect(client).to have_received(:create_invoice).once
     end
 
+    it "emits invoice envelope keys in WSDL sequence order" do
+      captured = nil
+      allow(client).to receive(:create_invoice) { |payload|
+        captured = payload
+        98765
+      }
+
+      described_class.perform_now(order.id)
+
+      expect(captured.keys).to eq(%w[
+        InvoiceDBID InvoiceNumber InvoiceDate DueDate CustomerID Paid SuppressTotal
+        ProjectID CurrencyCode ExchangeRate Lines NetAmount VATAmount AmountPaid
+        UseCustomDeliveryAddress CISRCNetAmount CISRCVatAmount IsCISReverseCharge
+      ])
+    end
+
+    it "sets the schema-required tail fields to arithmetically neutral defaults" do
+      captured = nil
+      allow(client).to receive(:create_invoice) { |payload|
+        captured = payload
+        98765
+      }
+
+      described_class.perform_now(order.id)
+
+      expect(captured.values_at("UseCustomDeliveryAddress", "CISRCNetAmount", "CISRCVatAmount", "IsCISReverseCharge"))
+        .to eq([false, 0, 0, false])
+    end
+
     it "does not call the client when no integration exists for the order's store" do
       integration.destroy!
 
