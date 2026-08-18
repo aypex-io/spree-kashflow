@@ -154,25 +154,143 @@ RSpec.describe Spree::Kashflow::Client do
     end
   end
 
+  # KashFlow has no InsertOrUpdateCustomer operation, so "upsert" is three
+  # operations: look the code up, then update or insert. 0.1.1 made customer
+  # codes stable per customer (which is what keeps one KashFlow customer per
+  # Spree customer), and that turned the missing lookup into a hard failure —
+  # the customer's *second* order collided with "Customer Code is not unique"
+  # and no invoice was ever posted for it.
   describe "#upsert_customer" do
-    it "returns the KashFlow customer id" do
-      stub_kashflow_call(
-        '<InsertCustomerResponse xmlns="KashFlowAPI">' \
-        "<InsertCustomerResult>555</InsertCustomerResult>" \
-        "</InsertCustomerResponse>"
-      )
+    let(:payload) { {"Code" => "SPU42", "Name" => "Ada Lovelace"} }
 
-      expect(client.upsert_customer({"Code" => "a@b.com"})).to eq(555)
+    def stub_get_customer_found(id = 555)
+      stub_kashflow_operation(
+        "GetCustomer",
+        '<GetCustomerResponse xmlns="KashFlowAPI"><GetCustomerResult>' \
+        "<CustomerID>#{id}</CustomerID><Code>SPU42</Code>" \
+        "</GetCustomerResult><Status>OK</Status></GetCustomerResponse>"
+      )
     end
 
-    it "raises ApiError instead of returning 0 when KashFlow returns no customer id" do
-      stub_kashflow_call(
+    def stub_get_customer_missing
+      stub_kashflow_operation(
+        "GetCustomer",
+        '<GetCustomerResponse xmlns="KashFlowAPI">' \
+        "<GetCustomerResult /><Status>OK</Status></GetCustomerResponse>"
+      )
+    end
+
+    def stub_insert_customer(id = 777)
+      stub_kashflow_operation(
+        "InsertCustomer",
         '<InsertCustomerResponse xmlns="KashFlowAPI">' \
-        "<InsertCustomerResult>0</InsertCustomerResult>" \
+        "<InsertCustomerResult>#{id}</InsertCustomerResult>" \
         "</InsertCustomerResponse>"
       )
+    end
 
-      expect { client.upsert_customer({}) }.to raise_error(Spree::Kashflow::ApiError, /customer id/)
+    def stub_update_customer
+      stub_kashflow_operation(
+        "UpdateCustomer",
+        '<UpdateCustomerResponse xmlns="KashFlowAPI">' \
+        "<UpdateCustomerResult /><Status>OK</Status></UpdateCustomerResponse>"
+      )
+    end
+
+    context "when no customer holds the code yet" do
+      it "inserts and returns the new customer id" do
+        stub_get_customer_missing
+        insert = stub_insert_customer(777)
+
+        expect(client.upsert_customer(payload)).to eq(777)
+        expect(insert).to have_been_requested
+      end
+
+      it "raises ApiError instead of returning 0 when KashFlow returns no customer id" do
+        stub_get_customer_missing
+        stub_insert_customer(0)
+
+        expect { client.upsert_customer(payload) }.to raise_error(Spree::Kashflow::ApiError, /customer id/)
+      end
+
+      # KashFlow's not-found signalling on GetCustomer is undocumented and no
+      # spec here can settle it, so both shapes it can take are treated as
+      # "no such customer": an empty result, and an in-band business
+      # rejection. Only ApiError is swallowed — an auth or transport failure
+      # must not be read as "absent" and turned into a duplicate insert.
+      it "inserts when KashFlow answers the lookup with a business rejection" do
+        stub_kashflow_operation(
+          "GetCustomer",
+          '<GetCustomerResponse xmlns="KashFlowAPI"><GetCustomerResult />' \
+          "<Status>NO</Status><StatusDetail>Customer not found</StatusDetail>" \
+          "</GetCustomerResponse>"
+        )
+        insert = stub_insert_customer(777)
+
+        expect(client.upsert_customer(payload)).to eq(777)
+        expect(insert).to have_been_requested
+      end
+    end
+
+    context "when the code already belongs to a customer" do
+      it "updates rather than inserting, and returns the existing id" do
+        stub_get_customer_found(555)
+        update = stub_update_customer
+        insert = stub_insert_customer
+
+        expect(client.upsert_customer(payload)).to eq(555)
+        expect(update).to have_been_requested
+        expect(insert).not_to have_been_requested
+      end
+
+      # `CustomerID` is the first element of the WSDL's `Customer` sequence, and
+      # an ASMX endpoint enforcing that sequence drops or mis-binds an
+      # out-of-order element rather than raising — an update that silently
+      # dropped the id would write to the wrong customer or to none.
+      it "sends CustomerID as the first element of the updated customer" do
+        stub_get_customer_found(555)
+        captured = nil
+        stub_request(:post, KashflowSoap::ENDPOINT)
+          .with(body: /<tns:UpdateCustomer>/)
+          .with { |request| captured = request.body }
+          .to_return(
+            status: 200,
+            body: '<?xml version="1.0" encoding="utf-8"?>' \
+                  '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>' \
+                  '<UpdateCustomerResponse xmlns="KashFlowAPI"><UpdateCustomerResult />' \
+                  "<Status>OK</Status></UpdateCustomerResponse></soap:Body></soap:Envelope>",
+            headers: {"Content-Type" => "text/xml; charset=utf-8"}
+          )
+
+        client.upsert_customer(payload)
+
+        expect(captured).to include(
+          "<tns:custr><tns:CustomerID>555</tns:CustomerID><tns:Code>SPU42</tns:Code>"
+        )
+      end
+
+      it "is idempotent across repeated syncs for the same customer" do
+        stub_get_customer_found(555)
+        stub_update_customer
+        insert = stub_insert_customer
+
+        3.times { expect(client.upsert_customer(payload)).to eq(555) }
+
+        expect(insert).not_to have_been_requested
+      end
+    end
+
+    it "propagates an authentication failure on the lookup rather than inserting" do
+      stub_kashflow_operation(
+        "GetCustomer",
+        '<GetCustomerResponse xmlns="KashFlowAPI"><GetCustomerResult />' \
+        "<Status>NO</Status><StatusDetail>Invalid Username or Password</StatusDetail>" \
+        "</GetCustomerResponse>"
+      )
+      insert = stub_insert_customer
+
+      expect { client.upsert_customer(payload) }.to raise_error(Spree::Kashflow::AuthenticationError)
+      expect(insert).not_to have_been_requested
     end
   end
 

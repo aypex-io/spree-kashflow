@@ -87,14 +87,28 @@ module Spree
       end
 
       ##
-      # Creates or updates a customer in KashFlow.
+      # Creates or updates a customer in KashFlow, keyed on the customer `Code`.
       #
-      # @param payload [Hash] a KashFlow `Customer` structure
-      # @return [Integer] the KashFlow customer id
+      # KashFlow publishes no `InsertOrUpdateCustomer`, so an upsert is a lookup
+      # followed by an `UpdateCustomer` or an `InsertCustomer`. The lookup is not
+      # optional: customer codes are stable per customer (that is what keeps one
+      # KashFlow customer per Spree customer rather than one per order), so an
+      # unconditional insert succeeds exactly once and every subsequent order for
+      # that customer is rejected with "Customer Code is not unique" — with no
+      # invoice posted.
+      #
+      # @param payload [Hash] a KashFlow `Customer` structure, whose `"Code"`
+      #   identifies the customer
+      # @return [Integer] the KashFlow customer id, existing or newly assigned
       # @raise [Spree::Kashflow::ApiError] when the request fails, or when
       #   KashFlow returns no usable customer id
+      # @raise [Spree::Kashflow::AuthenticationError] when KashFlow rejects the
+      #   credentials
       #
       def upsert_customer(payload)
+        existing_id = customer_id_for_code(payload["Code"])
+        return update_customer(existing_id, payload) if existing_id
+
         response = call(:insert_customer, {"custr" => payload})
         result = response.dig("InsertCustomerResponse", "InsertCustomerResult")
         assert_identifier!(result, "customer id")
@@ -194,6 +208,55 @@ module Spree
         Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::ETIMEDOUT, Errno::EHOSTUNREACH,
         Net::OpenTimeout, Net::ReadTimeout => e
         raise TransportError, e.message
+      end
+
+      ##
+      # Looks a customer up by its KashFlow `Code`.
+      #
+      # How KashFlow signals "no such customer" here is undocumented, and no
+      # spec that stubs the SOAP layer can settle it, so both shapes it can
+      # plausibly take are treated as absent: an empty `GetCustomerResult`, and
+      # an in-band business rejection. Only {ApiError} is swallowed — an
+      # authentication or transport failure must keep propagating, since
+      # reading either as "absent" would turn it into a duplicate insert and
+      # put the caller back on the collision this method exists to avoid.
+      #
+      # @param code [String, nil] the KashFlow customer code
+      # @return [Integer, nil] the customer id, or nil when no customer holds
+      #   that code
+      #
+      def customer_id_for_code(code)
+        return nil if code.to_s.strip.empty?
+
+        result = call(:get_customer, {"CustomerCode" => code})
+          .dig("GetCustomerResponse", "GetCustomerResult")
+        return nil unless result.is_a?(Hash)
+
+        identifier = result["CustomerID"].to_i
+        identifier.zero? ? nil : identifier
+      rescue ApiError
+        nil
+      end
+
+      ##
+      # Updates an existing KashFlow customer in place.
+      #
+      # `CustomerID` is prepended rather than merged onto the end because it is
+      # the first element of the WSDL's `Customer` sequence, and an ASMX
+      # endpoint enforcing that sequence drops or mis-binds an out-of-order
+      # element rather than raising — an update whose id was dropped would write
+      # to the wrong customer, or to none, and still return successfully.
+      #
+      # `UpdateCustomerResult` is a `s:string`, not the customer id, so the id
+      # is carried over from the lookup instead of being read off the response.
+      #
+      # @param identifier [Integer] the KashFlow customer id
+      # @param payload [Hash] a KashFlow `Customer` structure
+      # @return [Integer] the customer id that was updated
+      #
+      def update_customer(identifier, payload)
+        call(:update_customer, {"custr" => {"CustomerID" => identifier}.merge(payload)})
+        identifier
       end
 
       ##
