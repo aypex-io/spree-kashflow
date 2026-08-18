@@ -83,8 +83,73 @@ RSpec.describe Spree::Kashflow::CustomerPayload do
       expect(payload.to_h["Email"]).to eq("ada@example.com")
     end
 
-    it "uses the order email as the Code field" do
-      expect(payload.to_h["Code"]).to eq("ada@example.com")
+    # KashFlow rejects a Code containing special characters, and an email
+    # address is nothing but special characters:
+    #
+    #   NO: The customer code specified is invalid, please re-enter without
+    #       any special characters.
+    #
+    # This is the live tkf-prd failure from 2026-08-18 (order 12), which the
+    # previous expectation here — `eq("ada@example.com")` — actively locked in.
+    # A stubbed SOAP endpoint cannot reject a payload, so the charset guard has
+    # to be asserted directly.
+    describe "the Code field" do
+      it "contains only uppercase alphanumerics" do
+        expect(payload.to_h["Code"]).to match(/\A[A-Z0-9]+\z/)
+      end
+
+      it "is never the email address" do
+        expect(payload.to_h["Code"]).not_to include("@")
+      end
+
+      it "stays within KashFlow's customer-code length" do
+        expect(payload.to_h["Code"].length).to be <= Spree::Kashflow::CustomerPayload::CODE_MAX_LENGTH
+      end
+
+      # InsertCustomer upserts BY Code, so the code identifies the CUSTOMER.
+      # Deriving it per-order would create a fresh KashFlow customer on every
+      # order rather than updating the existing one.
+      context "for a registered user" do
+        let(:user) { build_stubbed(:user, id: 4711) }
+        let(:order) { build_stubbed(:order, user: user, email: "ada@example.com", bill_address: bill_address, store: store) }
+        let(:later_order) { build_stubbed(:order, user: user, email: "ada+new@example.com", bill_address: bill_address, store: store) }
+
+        it "derives the code from the user id" do
+          expect(payload.to_h["Code"]).to eq("SPU4711")
+        end
+
+        it "is stable across that user's orders even if the email changes" do
+          expect(described_class.new(later_order).to_h["Code"]).to eq(payload.to_h["Code"])
+        end
+      end
+
+      context "for a guest order" do
+        let(:order) { build_stubbed(:order, user: nil, email: "ada@example.com", bill_address: bill_address, store: store) }
+
+        it "derives a hashed code from the email" do
+          expect(payload.to_h["Code"]).to start_with("SPG")
+        end
+
+        it "is stable for the same email regardless of case or surrounding space" do
+          other = build_stubbed(:order, user: nil, email: "  ADA@Example.com  ", bill_address: bill_address, store: store)
+          expect(described_class.new(other).to_h["Code"]).to eq(payload.to_h["Code"])
+        end
+
+        it "differs for a different email" do
+          other = build_stubbed(:order, user: nil, email: "grace@example.com", bill_address: bill_address, store: store)
+          expect(described_class.new(other).to_h["Code"]).not_to eq(payload.to_h["Code"])
+        end
+      end
+
+      # Unreachable for a completed order (Spree validates email presence), but
+      # a blank email must not collapse every such order onto one shared code.
+      context "with neither a user nor an email" do
+        let(:order) { build_stubbed(:order, user: nil, email: nil, number: "R123456789", bill_address: bill_address, store: store) }
+
+        it "falls back to the order number" do
+          expect(payload.to_h["Code"]).to eq("R123456789")
+        end
+      end
     end
 
     it "splits the billing name into ContactFirstName and ContactLastName" do

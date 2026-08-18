@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require "spree/core"
 require "savon"
 require "spree/kashflow/version"
