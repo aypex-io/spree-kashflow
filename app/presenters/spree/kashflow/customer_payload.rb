@@ -24,6 +24,42 @@ module Spree
       VAT_NUMBER_METADATA_KEY = "vat_number"
 
       ##
+      # KashFlow rejects a customer `Code` that carries special characters:
+      #
+      #   NO: The customer code specified is invalid, please re-enter without
+      #       any special characters.
+      #
+      # v0.1.0 sent `order.email` here, so EVERY sync failed on the customer
+      # upsert before an invoice was ever attempted — caught on the first live
+      # order (tkf-prd order 12, 2026-08-18). The WSDL types `Code` as a bare
+      # `s:string` with no facets, so the rule is server-side and undiscoverable
+      # from the schema; these codes are therefore deliberately conservative —
+      # uppercase alphanumerics only, comfortably short.
+      #
+      # `InsertCustomer` upserts BY `Code`, so the code identifies the CUSTOMER,
+      # not the order. Anything per-order would create a fresh KashFlow customer
+      # on every purchase instead of updating the existing one.
+
+      # @return [String] format for a registered user's code, keyed on the Spree
+      #   user id so it survives the customer changing their email address.
+      USER_CODE_FORMAT = "SPU%d"
+
+      # @return [String] format for a guest's code. Guests have no stable id, so
+      #   the normalised email is hashed — same email in, same code out, which is
+      #   what keeps the upsert an update rather than a duplicate.
+      GUEST_CODE_FORMAT = "SPG%s"
+
+      # @return [Integer] hex characters of the email digest kept in a guest code.
+      #   12 hex chars is 48 bits: collision-safe at any plausible customer count
+      #   while leaving the total code short.
+      GUEST_CODE_DIGEST_LENGTH = 12
+
+      # @return [Integer] the longest code this presenter will emit. KashFlow does
+      #   not publish the limit in the WSDL; this is a conservative ceiling that
+      #   both formats stay well inside.
+      CODE_MAX_LENGTH = 20
+
+      ##
       # @param order [Spree::Order] a completed order with a billing address
       #
       def initialize(order)
@@ -43,7 +79,7 @@ module Spree
       #
       def to_h
         payload = {
-          "Code" => order.email,
+          "Code" => customer_code,
           "Name" => customer_name,
           "Email" => order.email,
           "Address1" => bill_address&.address1,
@@ -65,6 +101,41 @@ module Spree
 
       # @return [Spree::Order]
       attr_reader :order
+
+      ##
+      # The KashFlow customer reference. See {USER_CODE_FORMAT} for why this is
+      # keyed on the customer rather than the order, and why it is alphanumeric.
+      #
+      # The order-number fallback is unreachable for a completed order — Spree
+      # validates email presence — but it exists so a blank email cannot collapse
+      # every such order onto one shared code, which would merge unrelated
+      # customers into a single KashFlow record.
+      #
+      # @return [String] an uppercase-alphanumeric customer code
+      #
+      def customer_code
+        return format(USER_CODE_FORMAT, order.user_id) if order.user_id.present?
+        return order.number if normalized_email.blank?
+
+        format(GUEST_CODE_FORMAT, email_digest)
+      end
+
+      ##
+      # @return [String] the order email, lowercased and stripped, so that the
+      #   same guest is not split across several KashFlow customers by casing or
+      #   stray whitespace
+      #
+      def normalized_email
+        order.email.to_s.strip.downcase
+      end
+
+      ##
+      # @return [String] the leading {GUEST_CODE_DIGEST_LENGTH} hex characters of
+      #   the normalised email's SHA-256, uppercased
+      #
+      def email_digest
+        Digest::SHA256.hexdigest(normalized_email)[0, GUEST_CODE_DIGEST_LENGTH].upcase
+      end
 
       ##
       # Nullable on purpose. A digital-only order can complete with no billing
