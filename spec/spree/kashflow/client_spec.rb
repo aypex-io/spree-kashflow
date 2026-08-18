@@ -310,6 +310,81 @@ RSpec.describe Spree::Kashflow::Client do
       )
     end
 
+    # KashFlow types every date field in the WSDL as `s:dateTime`, and a .NET
+    # ASMX endpoint rejects the whole envelope when one of them is not valid
+    # xsd. Gyoku type-switches with `case/when Time`, which uses `===` — and
+    # `ActiveSupport::TimeWithZone` is a delegator, not a `Time` subclass, so it
+    # misses that branch and falls through to `to_s` ("2026-08-18 10:53:48 UTC").
+    # `Time.current` and every AR datetime attribute return exactly that class,
+    # so this is the default path, not an edge case. These specs assert the
+    # serialised body because no assertion on the payload Hash can see it: a
+    # `TimeWithZone` in a Hash looks correct right up until it hits the wire.
+    describe "temporal values" do
+      def captured_invoice_body(payload)
+        captured = nil
+        stub_request(:post, KashflowSoap::ENDPOINT)
+          .with { |request| captured = request.body }
+          .to_return(
+            status: 200,
+            body: '<?xml version="1.0" encoding="utf-8"?>' \
+                  '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body>' \
+                  '<InsertInvoice_TypeDefinedResponse xmlns="KashFlowAPI">' \
+                  "<InsertInvoice_TypeDefinedResult>4471</InsertInvoice_TypeDefinedResult>" \
+                  "</InsertInvoice_TypeDefinedResponse></soap:Body></soap:Envelope>",
+            headers: {"Content-Type" => "text/xml; charset=utf-8"}
+          )
+
+        client.create_invoice({"CustomerID" => 1}.merge(payload))
+        captured
+      end
+
+      it "serialises an ActiveSupport::TimeWithZone as xsd:dateTime" do
+        moment = Time.utc(2026, 8, 18, 10, 53, 48).in_time_zone("UTC")
+
+        body = captured_invoice_body("InvoiceDate" => moment)
+
+        expect(body).to include("<tns:InvoiceDate>2026-08-18T10:53:48Z</tns:InvoiceDate>")
+      end
+
+      it "serialises a TimeWithZone in a non-UTC zone as its UTC instant" do
+        moment = Time.utc(2026, 8, 18, 10, 53, 48).in_time_zone("Europe/London")
+
+        body = captured_invoice_body("InvoiceDate" => moment)
+
+        expect(body).to include("<tns:InvoiceDate>2026-08-18T10:53:48Z</tns:InvoiceDate>")
+      end
+
+      it "serialises a plain Time as xsd:dateTime" do
+        body = captured_invoice_body("InvoiceDate" => Time.utc(2026, 8, 18, 10, 53, 48))
+
+        expect(body).to include("<tns:InvoiceDate>2026-08-18T10:53:48Z</tns:InvoiceDate>")
+      end
+
+      it "serialises a Date as xsd:dateTime at midnight UTC" do
+        body = captured_invoice_body("InvoiceDate" => Date.new(2026, 8, 18))
+
+        expect(body).to include("<tns:InvoiceDate>2026-08-18T00:00:00Z</tns:InvoiceDate>")
+      end
+
+      it "coerces temporal values nested inside Lines" do
+        body = captured_invoice_body(
+          "Lines" => {"InvoiceLine" => [{"Date" => Time.utc(2026, 8, 18, 10, 53, 48).in_time_zone("UTC")}]}
+        )
+
+        expect(body).to include("<tns:Date>2026-08-18T10:53:48Z</tns:Date>")
+      end
+
+      it "never emits Ruby's Time#to_s format anywhere in the envelope" do
+        body = captured_invoice_body(
+          "InvoiceDate" => Time.current,
+          "DueDate" => Time.current,
+          "Lines" => {"InvoiceLine" => [{"Date" => Time.current}]}
+        )
+
+        expect(body).not_to match(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (UTC|[+-]\d{4})/)
+      end
+    end
+
     it "sends the credentials on every request" do
       captured = nil
       stub_request(:post, KashflowSoap::ENDPOINT)
