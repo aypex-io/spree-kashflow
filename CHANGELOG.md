@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.3
+
+- **Fix: `upsert_customer` only ever inserted.** KashFlow publishes no
+  `InsertOrUpdateCustomer`, and the client called `InsertCustomer`
+  unconditionally with no lookup. 0.1.1 made customer codes stable per customer
+  — which is what keeps one KashFlow customer per Spree customer rather than one
+  per order — and that turned the missing lookup into a hard failure: the insert
+  succeeded exactly once, and the same customer's *second* order was rejected
+  with `Customer Code is not unique`, posting no invoice. `upsert_customer` now
+  looks the code up with `GetCustomer` and either `UpdateCustomer`s the existing
+  record or `InsertCustomer`s a new one, so it is idempotent across repeated
+  syncs.
+- `CustomerID` is prepended to the update payload rather than merged onto the
+  end, because it is the first element of the WSDL's `Customer` sequence and an
+  ASMX endpoint enforcing that sequence drops or mis-binds an out-of-order
+  element rather than raising — an update whose id was dropped would write to
+  the wrong customer, or to none, and still return successfully.
+- How KashFlow signals "no such customer" on `GetCustomer` is undocumented, so
+  both plausible shapes are treated as absent: an empty result, and an in-band
+  business rejection. Only `ApiError` is swallowed; an authentication or
+  transport failure keeps propagating rather than being read as "absent" and
+  turned back into a duplicate insert.
+
 ## 0.1.2
 
 - **Fix: every order sync still failed against a live KashFlow account**, now on

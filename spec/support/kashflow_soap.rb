@@ -37,6 +37,33 @@ module KashflowSoap
     )
   end
 
+  ##
+  # Stubs a single SOAP operation, matched on the operation element in the
+  # request body. Needed wherever one public method makes more than one call
+  # (the customer upsert does a `GetCustomer` then an `InsertCustomer` or
+  # `UpdateCustomer`), since {#stub_kashflow_call} answers every POST to the
+  # endpoint identically and so cannot distinguish them.
+  #
+  # @param operation [String] the operation element name, e.g. "GetCustomer"
+  # @param body [String] the inner XML of the SOAP body to return
+  # @param status [Integer] HTTP status to return
+  # @return [WebMock::RequestStub]
+  #
+  def stub_kashflow_operation(operation, body, status: 200)
+    stub_request(:post, ENDPOINT)
+      .with(body: /<tns:#{Regexp.escape(operation)}>/)
+      .to_return(
+        status: status,
+        body: <<~XML,
+          <?xml version="1.0" encoding="utf-8"?>
+          <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+            <soap:Body>#{body}</soap:Body>
+          </soap:Envelope>
+        XML
+        headers: {"Content-Type" => "text/xml; charset=utf-8"}
+      )
+  end
+
   private
 
   ##
