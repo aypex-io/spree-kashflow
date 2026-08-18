@@ -182,7 +182,8 @@ module Spree
       #
       def call(operation, message = {})
         credentials = {"UserName" => @username, "Password" => @password}
-        response = savon_client.call(operation, message: credentials.merge(message))
+        body = coerce_temporal(credentials.merge(message))
+        response = savon_client.call(operation, message: body)
         body = response.body
         assert_status!(body)
         body
@@ -193,6 +194,48 @@ module Spree
         Errno::ECONNREFUSED, Errno::ECONNRESET, Errno::ETIMEDOUT, Errno::EHOSTUNREACH,
         Net::OpenTimeout, Net::ReadTimeout => e
         raise TransportError, e.message
+      end
+
+      ##
+      # Rewrites every temporal value in an outgoing message to xsd `dateTime`.
+      #
+      # KashFlow types every date field in the WSDL as `s:dateTime`, and its
+      # .NET `XmlSerializer` rejects the *entire* envelope with a
+      # `FormatException` ("is not a valid AllXsd value") when one of them is
+      # not valid xsd — the invoice is never created, and the fault names only
+      # a character offset, not the field.
+      #
+      # Gyoku cannot be relied on to do this. It type-switches with
+      # `case/when`, i.e. `Module#===`, so:
+      # - `ActiveSupport::TimeWithZone` is a *delegator*, not a `Time`
+      #   subclass, and misses the branch entirely -> `to_s`
+      #   ("2026-08-18 10:53:48 UTC").
+      # - plain `Time` is likewise emitted via `to_s` by Gyoku 1.4.
+      # - `Date` serialises as `2026-08-18`, an xsd `date`, not the `dateTime`
+      #   the schema asks for.
+      #
+      # `Time.current` and every Active Record datetime attribute return
+      # `TimeWithZone`, so the broken path was the default one, which is why
+      # every caller was affected. Normalising here rather than at each call
+      # site keeps the wire format owned by the one class that touches the
+      # wire, and means a date field added to any future payload is correct
+      # without the author having to know this.
+      #
+      # Values are converted to UTC first so the instant is preserved and the
+      # emitted form is unambiguous (`...Z`) regardless of the app's zone.
+      #
+      # @param value [Object] any message value; Hashes and Arrays are walked
+      # @return [Object] the value with temporals replaced by xsd strings
+      #
+      def coerce_temporal(value)
+        case value
+        when Hash then value.transform_values { |element| coerce_temporal(element) }
+        when Array then value.map { |element| coerce_temporal(element) }
+        when ActiveSupport::TimeWithZone, Time then value.utc.xmlschema
+        when DateTime then value.to_time.utc.xmlschema
+        when Date then value.to_time(:utc).xmlschema
+        else value
+        end
       end
 
       ##
