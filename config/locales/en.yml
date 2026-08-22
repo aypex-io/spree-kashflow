@@ -4,6 +4,7 @@ en:
       integrations:
         kashflow:
           brand_name: "KashFlow"
+          description: "Send completed orders to KashFlow as invoices, and refunds as credit notes."
           username: "API username"
           password: "API password"
           sales_nominal_code: "Sales nominal code"

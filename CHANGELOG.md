@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Add the `description` locale key the Spree admin reads for an integration's
+  one-line summary (`Spree.t("admin.integrations.kashflow.description")`, per
+  `spree_admin`'s `integrations/_integration` partial). Without it the
+  Integrations list rendered "No Description" beside the KashFlow entry.
+  Locale-only; no behaviour change.
+
 ## 0.1.3
 
 - **Fix: `upsert_customer` only ever inserted.** KashFlow publishes no
