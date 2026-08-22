@@ -214,4 +214,15 @@ RSpec.describe Spree::Integrations::Kashflow do
       expect(client).to have_received(:nominal_codes).once
     end
   end
+
+  describe "the admin summary" do
+    it "resolves the description the integrations list renders" do
+      expect(Spree.t("admin.integrations.kashflow.description"))
+        .to eq("Send completed orders to KashFlow as invoices, and refunds as credit notes.")
+    end
+
+    it "resolves the brand name" do
+      expect(described_class.integration_name).to eq("KashFlow")
+    end
+  end
 end
